@@ -246,7 +246,7 @@ memory and rebuilt from the file tree on startup.
 Each version file uses JSON frontmatter delimited by `---`, followed by a
 markdown body:
 
-```
+```md
 ---
 {
   "lifecycle": "active",
@@ -258,8 +258,9 @@ Body text in markdown.
 ```
 
 The JSON object holds all structured fields: `lifecycle`, `edges`, and any
-user-defined fields registered with the backend. Each protocol `Field` type
-maps to a key in this object. A key set to `null` represents a deletion
+user-defined fields registered with the backend. Registration is static:
+user-defined `Field` types are fixed at compile time and mapped to keys when
+the backend is constructed. A key set to `null` represents a deletion
 marker (`FieldRow::Deleted`) for that field. An absent key means the field
 is unchanged from the previous version and should be inherited during
 resolution.

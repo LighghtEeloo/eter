@@ -10,6 +10,11 @@ use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::hash::Hash;
 
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+
+pub mod filesystem;
+
 /// Global version number identifying an immutable snapshot of the graph.
 ///
 /// Each write produces a new `Eterator` strictly larger than any existing
@@ -149,7 +154,7 @@ pub enum GcOption {
 /// that the backend does not support will panic.
 pub trait Field: 'static {
     /// The content type stored in rows of this field's table.
-    type Content;
+    type Content: Clone + Debug + Serialize + DeserializeOwned + 'static;
 }
 
 /// Built-in field tracking node existence and lifecycle state.
@@ -161,7 +166,10 @@ pub trait Field: 'static {
 /// draft). The protocol only inspects presence, not the value.
 pub struct Lifecycle<L>(std::marker::PhantomData<L>);
 
-impl<L: 'static> Field for Lifecycle<L> {
+impl<L> Field for Lifecycle<L>
+where
+    L: Clone + Debug + Serialize + DeserializeOwned + 'static,
+{
     type Content = L;
 }
 
@@ -171,7 +179,7 @@ impl<L: 'static> Field for Lifecycle<L> {
 /// versioning and resolution rules as any other field.
 pub struct Edges<Id>(std::marker::PhantomData<Id>);
 
-impl<Id: Ord + 'static> Field for Edges<Id> {
+impl<Id: Ord + Clone + Debug + Serialize + DeserializeOwned + 'static> Field for Edges<Id> {
     type Content = BTreeSet<Id>;
 }
 
@@ -244,7 +252,7 @@ pub trait Eter {
     type NodeId: Eq + Hash + Clone + Ord + Debug;
 
     /// User-defined lifecycle state stored in the [`Lifecycle`] field.
-    type Lifecycle: Clone + Debug + 'static;
+    type Lifecycle: Clone + Debug + Serialize + DeserializeOwned + 'static;
 
     /// Error type for fallible store operations.
     type Error;
