@@ -120,6 +120,23 @@ impl<T> From<FieldRow<T>> for Resolution<T> {
 /// paired with its [`FieldRow`] content.
 pub type VersionedRow<T> = (Eterator, FieldRow<T>);
 
+/// Garbage-collection mode selection.
+///
+/// This unifies persistent-state and stateless GC into one entrypoint.
+/// Backends choose the live-version set according to this option, then
+/// collect rows that are unreachable from that live set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GcOption {
+    /// Use the backend's persistent retired-version set.
+    ///
+    /// Live versions are computed as "all store versions not retired."
+    UseRetiredSet,
+    /// Use an explicit live-version set for this call only.
+    ///
+    /// Does not modify the backend's persistent retired-version set.
+    UseLiveSet(BTreeSet<Eterator>),
+}
+
 /// Marker trait binding a field identity to its content type.
 ///
 /// Each field in a node schema is a distinct zero-sized type implementing
@@ -307,18 +324,17 @@ pub trait Eter {
         &mut self, versions: impl IntoIterator<Item = Eterator>,
     ) -> Result<(), Self::Error>;
 
-    /// Run garbage collection using the persistent retired set.
+    /// Run garbage collection with an explicit mode.
     ///
-    /// Frees field rows unreachable from any live (non-retired) version.
-    /// Never alters the result of a read through a live version.
-    fn gc(&mut self) -> Result<(), Self::Error>;
-
-    /// Run garbage collection with an explicit set of live versions.
+    /// - [`GcOption::UseRetiredSet`] uses the backend's persistent
+    ///   retired-version state.
+    /// - [`GcOption::UseLiveSet`] uses a caller-provided live set for
+    ///   this invocation only.
     ///
-    /// Stateless mode: treats everything not in `live` as retired for
-    /// this invocation only. Does not modify the persistent retired set.
-    fn gc_with_live(&mut self, live: impl IntoIterator<Item = Eterator>)
-    -> Result<(), Self::Error>;
+    /// In both modes, garbage collection frees rows unreachable from the
+    /// selected live-version set and never alters reads through those live
+    /// versions.
+    fn gc(&mut self, option: GcOption) -> Result<(), Self::Error>;
 
     /// The current retired-version set.
     ///
