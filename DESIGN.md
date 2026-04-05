@@ -1,9 +1,9 @@
-# Eter: Immutable Persistent Append-Only KV Graph Store
+# Eter: Immutable Persistent Graph Store Protocol
 
-Eter is a protocol for building infrastructural graph-shaped text data storage
-with explicit historical persistence. The protocol interface is defined in Rust,
-with multiple backends for various scenarios from direct markdown file lookup on
-host file system to concurrent database access.
+Eter is a protocol for versioned graph storage with immutable snapshots.
+The interface is defined as Rust traits, backend-agnostic by design, with
+implementations ranging from filesystem-backed stores to concurrent database
+engines.
 
 The basic idea is that the user does not mutate a database in place. Instead,
 the user works with stable "pointers" called `Eterator`s to immutable snapshots
