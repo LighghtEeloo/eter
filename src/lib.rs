@@ -116,6 +116,10 @@ impl<T> From<FieldRow<T>> for Resolution<T> {
     }
 }
 
+/// A versioned field row: the [`Eterator`] at which the row was written
+/// paired with its [`FieldRow`] content.
+pub type VersionedRow<T> = (Eterator, FieldRow<T>);
+
 /// Marker trait binding a field identity to its content type.
 ///
 /// Each field in a node schema is a distinct zero-sized type implementing
@@ -188,11 +192,21 @@ pub trait WriteTxn: Sized {
     /// Error type for the commit operation.
     type Error;
 
+    /// Write a [`FieldRow`] for a field on a node.
+    ///
+    /// This is the primitive write operation. [`WriteTxn::set`] and
+    /// [`WriteTxn::delete`] are convenience wrappers.
+    fn apply<F: Field>(self, node: &Self::NodeId, row: FieldRow<F::Content>) -> Self;
+
     /// Set a field's content for a node.
-    fn set<F: Field>(self, node: &Self::NodeId, content: F::Content) -> Self;
+    fn set<F: Field>(self, node: &Self::NodeId, content: F::Content) -> Self {
+        self.apply::<F>(node, FieldRow::Content(content))
+    }
 
     /// Write a deletion marker for a field on a node.
-    fn delete<F: Field>(self, node: &Self::NodeId) -> Self;
+    fn delete<F: Field>(self, node: &Self::NodeId) -> Self {
+        self.apply::<F>(node, FieldRow::Deleted)
+    }
 
     /// Commit all accumulated writes, producing a new snapshot.
     fn commit(self) -> Result<Eterator, Self::Error>;
@@ -243,6 +257,15 @@ pub trait Eter {
     /// field rows. Returns [`Eterator::EMPTY`] for an empty store.
     /// May be served from cache.
     fn current_version(&self) -> Result<Eterator, Self::Error>;
+
+    /// All rows ever written for a field on a node, in version order.
+    ///
+    /// Returns `(Eterator, FieldRow)` pairs spanning the full history
+    /// of this `(NodeId, field)`. Useful for auditing, diffing, and
+    /// building undo interfaces.
+    fn field_history<F: Field>(
+        &self, node: &Self::NodeId,
+    ) -> Result<Vec<VersionedRow<F::Content>>, Self::Error>;
 
     /// Check whether a `NodeId` has ever been used in the store.
     ///
@@ -302,6 +325,13 @@ pub trait Eter {
     /// Every version in this set is a candidate for garbage collection.
     /// Versions not in this set are considered live and must be preserved.
     fn retired_versions(&self) -> Result<BTreeSet<Eterator>, Self::Error>;
+
+    /// All live (non-retired) versions in the store.
+    ///
+    /// These are the versions for which reads are guaranteed to be
+    /// stable. Useful for deciding which versions to pass to
+    /// [`Eter::only_keep`] or [`Eter::retire`].
+    fn live_versions(&self) -> Result<BTreeSet<Eterator>, Self::Error>;
 }
 
 // -- Optional cache traits --
