@@ -1,8 +1,8 @@
-//! Eter: Immutable Persistent Append-Only KV Graph Store.
+//! Eter: Immutable Persistent Graph Store Protocol.
 //!
-//! This crate defines the protocol-level traits for Eter, a graph-shaped
-//! data store with explicit historical persistence. Backends implement
-//! [`Eter`] to provide concrete storage.
+//! This crate defines the protocol-level traits for Eter, a versioned
+//! graph store with immutable snapshots. Backends implement [`Eter`] to
+//! provide concrete storage.
 //!
 //! See `DESIGN.md` for the full design rationale.
 
@@ -79,6 +79,43 @@ impl<T> Resolution<T> {
     }
 }
 
+/// A stored field row: either content or a deletion marker.
+///
+/// This is the write-side and storage-side representation. Unlike
+/// [`Resolution`], there is no `Absent` variant; absence is a query-time
+/// concept indicating no row was found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FieldRow<T> {
+    /// The row holds content.
+    Content(T),
+    /// The row is a deletion marker.
+    Deleted,
+}
+
+impl<T> FieldRow<T> {
+    /// Returns `true` if the row holds content.
+    pub fn is_content(&self) -> bool {
+        matches!(self, Self::Content(_))
+    }
+
+    /// Applies `f` to the contained content, preserving deletion markers.
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> FieldRow<U> {
+        match self {
+            | Self::Content(v) => FieldRow::Content(f(v)),
+            | Self::Deleted => FieldRow::Deleted,
+        }
+    }
+}
+
+impl<T> From<FieldRow<T>> for Resolution<T> {
+    fn from(row: FieldRow<T>) -> Self {
+        match row {
+            | FieldRow::Content(v) => Resolution::Content(v),
+            | FieldRow::Deleted => Resolution::Deleted,
+        }
+    }
+}
+
 /// Marker trait binding a field identity to its content type.
 ///
 /// Each field in a node schema is a distinct zero-sized type implementing
@@ -115,6 +152,22 @@ pub struct Edges<Id>(std::marker::PhantomData<Id>);
 
 impl<Id: Ord + 'static> Field for Edges<Id> {
     type Content = BTreeSet<Id>;
+}
+
+/// Diagnostic surfaced when reading a self-contained node.
+///
+/// Nodes are always renderable regardless of neighbor state. Warnings
+/// report structural issues without preventing a read from completing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Warning<Id> {
+    /// An edge references a target `NodeId` that does not exist or has
+    /// been deleted at the queried snapshot.
+    DanglingEdge {
+        /// The node holding the edge.
+        source: Id,
+        /// The referenced node that is absent.
+        target: Id,
+    },
 }
 
 /// Write transaction accumulating field updates for a single version.
@@ -198,6 +251,15 @@ pub trait Eter {
     /// to verify uniqueness before inserting a new node.
     fn node_id_in_use(&self, id: &Self::NodeId) -> Result<bool, Self::Error>;
 
+    /// Check an edge set for dangling references at a given snapshot.
+    ///
+    /// Returns a [`Warning`] for each target in `targets` that does not
+    /// exist at `at`. The edge set is unmodified; the source node
+    /// remains fully renderable.
+    fn check_edges(
+        &self, at: Eterator, source: &Self::NodeId, targets: &BTreeSet<Self::NodeId>,
+    ) -> Result<Vec<Warning<Self::NodeId>>, Self::Error>;
+
     // -- Writes --
 
     /// Begin a write transaction.
@@ -234,4 +296,32 @@ pub trait Eter {
     /// this invocation only. Does not modify the persistent retired set.
     fn gc_with_live(&mut self, live: impl IntoIterator<Item = Eterator>)
     -> Result<(), Self::Error>;
+
+    /// The current retired-version set.
+    ///
+    /// Every version in this set is a candidate for garbage collection.
+    /// Versions not in this set are considered live and must be preserved.
+    fn retired_versions(&self) -> Result<BTreeSet<Eterator>, Self::Error>;
+}
+
+// -- Optional cache traits --
+
+/// Optional trait for backends that cache the live-node set.
+///
+/// Without this, enumerating live nodes requires scanning the full
+/// `NodeId` space and checking each node's `lifecycle` field.
+pub trait LiveNodes: Eter {
+    /// All `NodeId`s whose [`Lifecycle`] field resolves to content at `at`.
+    fn live_nodes(&self, at: Eterator) -> Result<BTreeSet<Self::NodeId>, Self::Error>;
+}
+
+/// Optional trait for backends that maintain a reverse-edge index.
+///
+/// Without this, ingress-edge queries require a full scan of all nodes'
+/// edge fields.
+pub trait ReverseEdges: Eter {
+    /// All `NodeId`s that have an egress edge pointing to `target` at `at`.
+    fn ingress_edges(
+        &self, at: Eterator, target: &Self::NodeId,
+    ) -> Result<BTreeSet<Self::NodeId>, Self::Error>;
 }
