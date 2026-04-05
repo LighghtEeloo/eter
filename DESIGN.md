@@ -207,3 +207,101 @@ stores.
 The protocol is backend-agnostic: it defines traits that any conforming
 backend implements.
 
+## Filesystem Backend
+
+The filesystem backend stores nodes as markdown files. It targets
+single-user, human-readable scenarios where the store doubles as a
+browsable document tree. No concurrency support.
+
+### Layout
+
+The user provides a root directory for the store.
+It must be empty on first use or contain a valid prior store state.
+
+```
+<root>/
+  <node_id>/
+    <version>-<node_id>.md
+    ...
+  ...
+```
+
+Each node occupies a subdirectory named by its `NodeId`, which must be
+filesystem-friendly: no path separators, no `.` or `..`, no null bytes,
+and reasonable length. Inside are markdown files, one per version.
+
+The filename is `<version>-<node_id>.md` where `<version>` is the 64-bit
+version number zero-padded to 16 hexadecimal digits. Zero-padding ensures
+lexicographic filename order matches version order. The `<node_id>` suffix
+is redundant with the directory name but aids readability in editors and
+tools that display only the filename.
+
+The backend has no persistent global state on disk. It does not record a
+retired-version set. Retired and live versions must be tracked by the user
+and provided to garbage collection calls. Only derived caches are held in
+memory and rebuilt from the file tree on startup.
+
+### File Format
+
+Each version file uses JSON frontmatter delimited by `---`, followed by a
+markdown body:
+
+```
+---
+{
+  "lifecycle": "active",
+  "edges": ["target_a", "target_b"]
+}
+---
+
+Body text in markdown.
+```
+
+The JSON object holds all structured fields: `lifecycle`, `edges`, and any
+user-defined fields registered with the backend. Each protocol `Field` type
+maps to a key in this object. A key set to `null` represents a deletion
+marker (`FieldRow::Deleted`) for that field. An absent key means the field
+is unchanged from the previous version and should be inherited during
+resolution.
+
+Per-version metadata is complete across pathname and frontmatter:
+
+- Path metadata: `NodeId` from `<root>/<node_id>/`.
+- Filename metadata: `version` from `<version>-<node_id>.md`.
+- Frontmatter metadata: all protocol fields (`lifecycle`, `edges`, and
+  registered user fields), with `null` encoding field deletion markers.
+
+No additional hidden metadata exists for this backend.
+
+The markdown text after the closing delimiter is the node's body, a
+privileged content field specific to this backend. It has no representation
+in the JSON header.
+
+### Protocol Mapping
+
+All fields for a given `(NodeId, version)` are co-located in a single file.
+This is per-node storage: every write creates a new file containing all
+fields, copying unchanged values from the previous version. The trade-off
+is more storage on partial updates in exchange for simpler resolution,
+atomic per-node snapshots, and human-readable files.
+
+**resolve.** Scan filenames in `<root>/<node_id>/`, find the file with the
+largest hex version ≤ the queried `Eterator`, parse the JSON header, and
+return the requested field. For the body field, return the markdown text.
+
+**write.** Assign the next version (one greater than the current maximum).
+Create a new file in `<root>/<node_id>/` with the updated fields and all
+unchanged fields copied from the previous version.
+
+**current_version.** The maximum hex version across all filenames in the
+root. Cached in memory after the initial scan and incremented on each
+write.
+
+**field_history.** List all files in `<root>/<node_id>/` in version order
+and parse the requested field from each.
+
+**gc.** Delete version files whose versions are retired and superseded by
+a later version for all live `Eterator`s. The backend does not persist the
+retired set; callers must provide live or retired versions explicitly for
+each collection run.
+
