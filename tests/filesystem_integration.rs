@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
 
 use eter::filesystem::{FilesystemBackend, FilesystemNodeId, builtins_registry};
-use eter::{Edges, Eter, Eterator, Field, FieldRow, GcOption, Lifecycle, Resolution, Warning, WriteTxn};
+use eter::{
+    Edges, Eter, Eterator, Field, FieldRow, GcOption, Lifecycle, Resolution, Warning, WriteTxn,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,10 +120,7 @@ fn empty_transaction_is_noop_and_returns_current_version() -> Result<(), Box<dyn
     let temp = tempfile::tempdir()?;
     let mut store = open_store(temp.path())?;
     let alpha = FilesystemNodeId::new("alpha")?;
-    let v1 = store
-        .write()
-        .set::<Lifecycle<LifeState>>(&alpha, LifeState::Active)
-        .commit()?;
+    let v1 = store.write().set::<Lifecycle<LifeState>>(&alpha, LifeState::Active).commit()?;
 
     // Empty transaction: no pending mutations.
     let v_noop = store.write().commit()?;
@@ -165,10 +164,7 @@ fn resolution_absent_for_never_written_field() -> Result<(), Box<dyn std::error:
     let mut store = open_store(temp.path())?;
 
     let alpha = FilesystemNodeId::new("alpha")?;
-    let v1 = store
-        .write()
-        .set::<Lifecycle<LifeState>>(&alpha, LifeState::Active)
-        .commit()?;
+    let v1 = store.write().set::<Lifecycle<LifeState>>(&alpha, LifeState::Active).commit()?;
 
     // PriorityField was never written for alpha.
     assert_eq!(store.resolve::<PriorityField>(v1, &alpha)?, Resolution::Absent);
@@ -181,10 +177,7 @@ fn resolution_absent_for_unknown_node() -> Result<(), Box<dyn std::error::Error>
     let mut store = open_store(temp.path())?;
 
     let alpha = FilesystemNodeId::new("alpha")?;
-    let v1 = store
-        .write()
-        .set::<Lifecycle<LifeState>>(&alpha, LifeState::Active)
-        .commit()?;
+    let v1 = store.write().set::<Lifecycle<LifeState>>(&alpha, LifeState::Active).commit()?;
 
     let ghost = FilesystemNodeId::new("ghost")?;
     assert_eq!(store.resolve::<TitleField>(v1, &ghost)?, Resolution::Absent);
@@ -207,18 +200,9 @@ fn historical_snapshot_read_returns_old_value() -> Result<(), Box<dyn std::error
     let v2 = store.write().set::<TitleField>(&alpha, "Second".to_owned()).commit()?;
     let v3 = store.write().set::<TitleField>(&alpha, "Third".to_owned()).commit()?;
 
-    assert_eq!(
-        store.resolve::<TitleField>(v1, &alpha)?,
-        Resolution::Content("First".to_owned())
-    );
-    assert_eq!(
-        store.resolve::<TitleField>(v2, &alpha)?,
-        Resolution::Content("Second".to_owned())
-    );
-    assert_eq!(
-        store.resolve::<TitleField>(v3, &alpha)?,
-        Resolution::Content("Third".to_owned())
-    );
+    assert_eq!(store.resolve::<TitleField>(v1, &alpha)?, Resolution::Content("First".to_owned()));
+    assert_eq!(store.resolve::<TitleField>(v2, &alpha)?, Resolution::Content("Second".to_owned()));
+    assert_eq!(store.resolve::<TitleField>(v3, &alpha)?, Resolution::Content("Third".to_owned()));
     Ok(())
 }
 
@@ -251,10 +235,7 @@ fn node_lifecycle_delete_and_recreate() -> Result<(), Box<dyn std::error::Error>
         .commit()?;
 
     assert!(store.node_exists(v3, &alpha)?);
-    assert_eq!(
-        store.resolve::<TitleField>(v3, &alpha)?,
-        Resolution::Content("Reborn".to_owned())
-    );
+    assert_eq!(store.resolve::<TitleField>(v3, &alpha)?, Resolution::Content("Reborn".to_owned()));
     // Historical read: node was absent at v2.
     assert!(!store.node_exists(v2, &alpha)?);
     Ok(())
@@ -287,10 +268,7 @@ fn check_edges_reports_dangling_targets() -> Result<(), Box<dyn std::error::Erro
 
     let warnings = store.check_edges(v1, &alpha, &edges)?;
     assert_eq!(warnings.len(), 1);
-    assert_eq!(
-        warnings[0],
-        Warning::DanglingEdge { source: alpha.clone(), target: ghost.clone() }
-    );
+    assert_eq!(warnings[0], Warning::DanglingEdge { source: alpha.clone(), target: ghost.clone() });
     Ok(())
 }
 
@@ -362,10 +340,7 @@ fn retire_and_gc_with_retired_set() -> Result<(), Box<dyn std::error::Error>> {
     store.gc(GcOption::UseRetiredSet)?;
 
     // Only v3 is live; v1 and v2 history is gone.
-    assert_eq!(
-        store.field_history::<PriorityField>(&alpha)?,
-        vec![(v3, FieldRow::Content(30))]
-    );
+    assert_eq!(store.field_history::<PriorityField>(&alpha)?, vec![(v3, FieldRow::Content(30))]);
     assert_eq!(store.current_version()?, v3);
     Ok(())
 }
@@ -395,10 +370,7 @@ fn only_keep_retires_all_except_specified() -> Result<(), Box<dyn std::error::Er
     assert_eq!(live, BTreeSet::from([v3]));
 
     store.gc(GcOption::UseRetiredSet)?;
-    assert_eq!(
-        store.field_history::<PriorityField>(&alpha)?,
-        vec![(v3, FieldRow::Content(3))]
-    );
+    assert_eq!(store.field_history::<PriorityField>(&alpha)?, vec![(v3, FieldRow::Content(3))]);
     Ok(())
 }
 
@@ -408,10 +380,7 @@ fn live_versions_excludes_retired() -> Result<(), Box<dyn std::error::Error>> {
     let mut store = open_store(temp.path())?;
 
     let alpha = FilesystemNodeId::new("alpha")?;
-    let v1 = store
-        .write()
-        .set::<Lifecycle<LifeState>>(&alpha, LifeState::Active)
-        .commit()?;
+    let v1 = store.write().set::<Lifecycle<LifeState>>(&alpha, LifeState::Active).commit()?;
     let v2 = store.write().set::<TitleField>(&alpha, "hello".to_owned()).commit()?;
 
     assert_eq!(store.live_versions()?, BTreeSet::from([v1, v2]));

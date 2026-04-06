@@ -14,6 +14,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 pub mod filesystem;
+#[cfg(feature = "lmdb")]
+pub mod lmdb;
 
 /// Global version number identifying an immutable snapshot of the graph.
 ///

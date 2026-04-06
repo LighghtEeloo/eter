@@ -3,11 +3,15 @@ name = "eter"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+lmdb = ["dep:heed"]
+
 [dependencies]
-serde = { version = "*", features = ["derive"] }
-serde_json = "*"
-thiserror = "*"
-tracing = "*"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+heed = { version = "0.22.0", optional = true }
 
 [dev-dependencies]
-tempfile = "*"
+tempfile = "3.27"

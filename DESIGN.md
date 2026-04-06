@@ -362,12 +362,34 @@ lower versions before higher versions lexicographically, which is required for
 the backward-seek resolution algorithm. Because the `NodeId` prefix is
 fixed-length, the split between the two parts is unambiguous.
 
+### Value Encoding
+
+Each row value uses a one-byte tag prefix followed by optional content.
+
+- `0x00`: deletion marker (`FieldRow::Deleted`). No further bytes.
+- `0x01, ...json`: content (`FieldRow::Content`), where the remaining bytes
+  are the `serde_json`-serialized field value.
+
+The tag distinguishes deletion markers from content without relying on absent
+keys, which carry a separate meaning (the field has never been written for
+this node at or before the queried version).
+
+### Write Transaction
+
+The write transaction (`WriteTxn`) accumulates field rows in memory and opens
+a single LMDB write transaction only at commit time. The alternative—holding
+the LMDB write transaction open from the moment `WriteTxn` is created—would
+block all GC passes and any operation that requires a write lock for the
+duration of accumulation. Buffering in memory and committing atomically avoids
+this hazard. On commit, all buffered field rows and a `_versions` entry are
+written in one atomic step.
+
 ### Resolution
 
 Reading field `F` of node `N` at `Eterator(V)`:
 
 1. Open a short-lived read transaction.
-2. Seek to the first key ≥ `N || V` using `get_lower_bound`.
+2. Seek to the first key ≥ `N || V` using a lower-bound cursor seek.
 3. If the key equals `N || V` exactly, the row at version `V` exists; return
    it directly.
 4. Otherwise step the cursor back one position.
@@ -376,6 +398,18 @@ Reading field `F` of node `N` at `Eterator(V)`:
 6. If the cursor is before the start of the database or the key prefix does
    not equal the bytes of `N`, the field is absent for this node.
 7. Close the read transaction.
+
+This is O(log n) in the total number of rows for field `F`, since the
+lower-bound seek is a single B-tree traversal. The current implementation
+uses `rev_prefix_iter` instead of a lower-bound seek, because the `heed`
+0.22 `Bytes` codec does not expose range bounds in a form that composes
+cleanly with the composite `&[u8]` key type. `rev_prefix_iter` starts at
+the newest row for `N` in field `F` and scans backward, stopping at the
+first version ≤ `V`. This is O(1) for the common case (resolving at the
+current version) and O(k) in the worst case, where k is the number of
+versions of `(N, F)` newer than `V`. The two approaches produce identical
+results; the lower-bound variant should be preferred if a compatible range
+API becomes available.
 
 ### Eterators and Read Transactions
 
@@ -437,12 +471,21 @@ require a full field-table traversal.
 
 ### Garbage Collection
 
-GC runs inside a single write transaction. It first scans the per-field
-databases to identify collectible rows per the algorithm in the Garbage
-Collection section, then deletes those rows and removes the corresponding
-version entries from `_versions` and `_retired`. Removing collected versions
-from `_versions` and `_retired` bounds the growth of both auxiliary tables to
-the number of live versions, not the total number of versions ever written.
+GC runs in two phases. The read phase opens a read transaction, computes the
+live set, scans every per-field database for collectible keys, and collects
+those keys in memory. The read transaction is then closed. The write phase
+opens a write transaction, deletes all collected keys, and scans the field
+databases (within the same write transaction, which sees the deletions) to
+determine which version numbers still have at least one row. Any version
+present in `_versions` but absent from the remaining rows is removed from
+both `_versions` and `_retired`. This bounds the growth of both auxiliary
+tables to the number of live versions, not the total number of versions ever
+written.
+
+Splitting GC into a read phase and a write phase is necessary because LMDB
+cursors used for scanning cannot coexist with mutations in the same table
+within a single cursor lifetime. Collecting keys into memory first, then
+deleting them in a separate pass, avoids this constraint.
 
 Deleted rows return their pages to LMDB's freelist; the database file does not
 shrink. To reclaim disk space after a GC pass, the caller must compact the

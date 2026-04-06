@@ -746,9 +746,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "field type registered more than once")]
     fn registry_panics_on_duplicate_type() {
-        FilesystemFieldRegistry::new()
-            .with_field::<TagField>("tag")
-            .with_field::<TagField>("tag2");
+        FilesystemFieldRegistry::new().with_field::<TagField>("tag").with_field::<TagField>("tag2");
     }
 
     #[test]
@@ -813,42 +811,36 @@ mod tests {
     #[test]
     fn parse_versioned_filename_valid() {
         let id = node("alpha");
-        let v = FilesystemBackend::<State>::parse_versioned_filename(
-            "000000000000000f-alpha.md",
-            &id,
-        )
-        .unwrap();
+        let v =
+            FilesystemBackend::<State>::parse_versioned_filename("000000000000000f-alpha.md", &id)
+                .unwrap();
         assert_eq!(v, Eterator(15));
     }
 
     #[test]
     fn parse_versioned_filename_wrong_node_suffix() {
         let id = node("alpha");
-        assert!(FilesystemBackend::<State>::parse_versioned_filename(
-            "000000000000000f-beta.md",
-            &id,
-        )
-        .is_err());
+        assert!(
+            FilesystemBackend::<State>::parse_versioned_filename("000000000000000f-beta.md", &id,)
+                .is_err()
+        );
     }
 
     #[test]
     fn parse_versioned_filename_wrong_hex_length() {
         let id = node("alpha");
-        assert!(FilesystemBackend::<State>::parse_versioned_filename(
-            "000f-alpha.md",
-            &id,
-        )
-        .is_err());
+        assert!(
+            FilesystemBackend::<State>::parse_versioned_filename("000f-alpha.md", &id,).is_err()
+        );
     }
 
     #[test]
     fn parse_versioned_filename_non_hex_version() {
         let id = node("alpha");
-        assert!(FilesystemBackend::<State>::parse_versioned_filename(
-            "zzzzzzzzzzzzzzzz-alpha.md",
-            &id,
-        )
-        .is_err());
+        assert!(
+            FilesystemBackend::<State>::parse_versioned_filename("zzzzzzzzzzzzzzzz-alpha.md", &id,)
+                .is_err()
+        );
     }
 
     // -- open() --
@@ -904,16 +896,8 @@ mod tests {
         let mut store = open(temp.path());
         let a = node("a");
         assert_eq!(store.current_version().unwrap(), Eterator::EMPTY);
-        let v1 = store
-            .write()
-            .set::<Lifecycle<State>>(&a, State::Active)
-            .commit()
-            .unwrap();
-        let v2 = store
-            .write()
-            .set::<TagField>(&a, "x".to_owned())
-            .commit()
-            .unwrap();
+        let v1 = store.write().set::<Lifecycle<State>>(&a, State::Active).commit().unwrap();
+        let v2 = store.write().set::<TagField>(&a, "x".to_owned()).commit().unwrap();
         assert!(Eterator::EMPTY < v1);
         assert!(v1 < v2);
         assert_eq!(store.current_version().unwrap(), v2);
@@ -948,11 +932,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut store = open(temp.path());
         let a = node("a");
-        store
-            .write()
-            .set::<Lifecycle<State>>(&a, State::Active)
-            .commit()
-            .unwrap();
+        store.write().set::<Lifecycle<State>>(&a, State::Active).commit().unwrap();
         assert!(store.node_id_in_use(&a).unwrap());
     }
 
@@ -963,11 +943,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut store = open(temp.path());
         let a = node("a");
-        let v1 = store
-            .write()
-            .set::<Lifecycle<State>>(&a, State::Active)
-            .commit()
-            .unwrap();
+        let v1 = store.write().set::<Lifecycle<State>>(&a, State::Active).commit().unwrap();
         store.retire([v1]).unwrap();
         assert!(store.retired_versions().unwrap().contains(&v1));
     }
@@ -977,11 +953,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut store = open(temp.path());
         let a = node("a");
-        let v1 = store
-            .write()
-            .set::<Lifecycle<State>>(&a, State::Active)
-            .commit()
-            .unwrap();
+        let v1 = store.write().set::<Lifecycle<State>>(&a, State::Active).commit().unwrap();
         let v2 = store.write().set::<TagField>(&a, "t".to_owned()).commit().unwrap();
         store.only_keep([v2]).unwrap();
         let retired = store.retired_versions().unwrap();
@@ -994,11 +966,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut store = open(temp.path());
         let a = node("a");
-        let v1 = store
-            .write()
-            .set::<Lifecycle<State>>(&a, State::Active)
-            .commit()
-            .unwrap();
+        let v1 = store.write().set::<Lifecycle<State>>(&a, State::Active).commit().unwrap();
         let v2 = store.write().set::<TagField>(&a, "t".to_owned()).commit().unwrap();
         store.retire([v1]).unwrap();
         let live = store.live_versions().unwrap();
@@ -1023,10 +991,7 @@ mod tests {
         store.retire([v1]).unwrap();
         store.gc(GcOption::UseRetiredSet).unwrap();
         // v1 file is gone; reading at v2 still works.
-        assert_eq!(
-            store.resolve::<CountField>(v2, &a).unwrap(),
-            Resolution::Content(2)
-        );
+        assert_eq!(store.resolve::<CountField>(v2, &a).unwrap(), Resolution::Content(2));
         assert!(store.field_history::<CountField>(&a).unwrap().len() == 1);
     }
 
@@ -1043,10 +1008,7 @@ mod tests {
             .unwrap();
         let v2 = store.write().set::<CountField>(&a, 20).commit().unwrap();
         store.gc(GcOption::UseLiveSet(std::collections::BTreeSet::from([v2]))).unwrap();
-        assert_eq!(
-            store.resolve::<CountField>(v2, &a).unwrap(),
-            Resolution::Content(20)
-        );
+        assert_eq!(store.resolve::<CountField>(v2, &a).unwrap(), Resolution::Content(20));
         // v1 is now unreachable; its row was removed.
         let hist = store.field_history::<CountField>(&a).unwrap();
         assert!(!hist.iter().any(|(v, _)| *v == v1));
