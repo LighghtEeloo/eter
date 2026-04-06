@@ -197,13 +197,15 @@ The storage model relies on ordered `(NodeId, field, version)` keys, prefix
 scans, and backward seeks. These requirements point toward sorted key-value
 stores.
 
-- **LMDB** (via `heed`): B-tree, MVCC, memory-mapped. Single-writer by
-  design, matching the simplest concurrency model. Lock-free read transactions.
-- **redb**: Pure-Rust B-tree store. Simpler dependency graph. Similar access
-  patterns.
-- **Filesystem.** Each node is a directory, each field a file, versions
+- **Filesystem**: Each node is a directory, each field a file, versions
   encoded in filenames or appended entries. No concurrency support; suitable
   for single-user, human-readable scenarios.
+- **LMDB** (via `heed`): B-tree, MVCC, memory-mapped. Single-writer by
+  design, matching the simplest concurrency model. Lock-free read transactions.
+  Requires `NodeId` to produce fixed-size, sort-preserving bytes;
+  see the [LMDB Backend](#lmdb-backend) section.
+- **redb**: Pure-Rust B-tree store. Simpler dependency graph. Similar access
+  patterns.
 
 The protocol is backend-agnostic: it defines traits that any conforming
 backend implements.
@@ -306,4 +308,146 @@ and parse the requested field from each.
 a later version for all live `Eterator`s. The backend does not persist the
 retired set; callers must provide live or retired versions explicitly for
 each collection run.
+
+
+## LMDB Backend
+
+The LMDB backend targets durable, transactional storage under single-writer
+access. It uses the `heed` crate for LMDB bindings. Read transactions are
+lock-free; at most one write transaction may be open at a time.
+
+### NodeId Constraint
+
+The `NodeId` type used with this backend must implement `LmdbKey`, a
+backend-local trait with two properties. `to_key_bytes` returns the byte
+representation of the id. `KEY_LEN` is a compile-time constant declaring the
+exact byte length; every value of the type must produce exactly that many
+bytes. The byte representation must be order-preserving: `a < b` under the
+type's `Ord` impl must imply `to_key_bytes(a) < to_key_bytes(b)`
+lexicographically. UUIDs (16 bytes, big-endian), integer ids (4 or 8 bytes,
+big-endian), and fixed-width padded slugs satisfy this constraint.
+Variable-length encodings are not permitted.
+
+The fixed-size requirement eliminates composite-key ambiguity: because the
+`NodeId` portion of every key occupies exactly `KEY_LEN` bytes, the version
+boundary is at a known offset and no separator or length prefix is needed.
+
+### Layout
+
+The backend opens a single LMDB environment. Opening the same environment
+path from two processes simultaneously is unsupported; LMDB enforces
+single-environment access via file locking.
+
+The environment contains:
+
+- One named database per registered `Field` type, identified by the field's
+  static name string.
+- `_versions`: the version registry, recording every version ever committed.
+- `_retired`: the persistent retired-version set.
+
+The names `_versions` and `_retired` are reserved. A registered `Field` whose
+static name matches either will collide with a backend database at construction
+time; the backend rejects this at construction with a panic.
+
+The total database count is `|registered fields| + 2`. The backend derives
+`max_dbs` from the registered field list at construction time; the caller does
+not set it manually.
+
+### Key Encoding
+
+Within each per-field database, rows are keyed by a fixed-size composite key:
+the `LmdbKey` bytes of the `NodeId` (exactly `KEY_LEN` bytes) followed by the
+8-byte big-endian encoding of the version number. Big-endian encoding places
+lower versions before higher versions lexicographically, which is required for
+the backward-seek resolution algorithm. Because the `NodeId` prefix is
+fixed-length, the split between the two parts is unambiguous.
+
+### Resolution
+
+Reading field `F` of node `N` at `Eterator(V)`:
+
+1. Open a short-lived read transaction.
+2. Seek to the first key ≥ `N || V` using `get_lower_bound`.
+3. If the key equals `N || V` exactly, the row at version `V` exists; return
+   it directly.
+4. Otherwise step the cursor back one position.
+5. If the resulting key begins with the bytes of `N`, decode the version and
+   value from the key and the stored data. The resolution is complete.
+6. If the cursor is before the start of the database or the key prefix does
+   not equal the bytes of `N`, the field is absent for this node.
+7. Close the read transaction.
+
+### Eterators and Read Transactions
+
+`Eterator` holds no LMDB resource; it is a plain version number. Each call to
+`resolve` opens a read transaction, executes the seek described above, and
+closes the transaction before returning. No read transaction persists beyond a
+single call.
+
+This model avoids two LMDB hazards. First, LMDB's reader table has a finite
+number of slots (configurable, defaulting to 126). Keeping one slot open per
+live `Eterator` would exhaust this table for workloads with many concurrent
+snapshots. Second, long-lived read transactions pin LMDB's freelist: pages
+freed by garbage collection cannot be recycled while a reader that predates
+the deletion is open, causing the database file to grow without bound. The
+per-call transaction model eliminates both problems.
+
+The trade-off is that a sequence of `resolve` calls at the same `Eterator`
+is not protected by a single LMDB snapshot. Under single-writer access, a
+write cannot interleave with an in-progress logical read operation, so this is
+safe in practice. Applications that require strict multi-field snapshot
+consistency may use the backend's `read_txn` method to open an explicit
+`heed::RoTxn` and pass it to `resolve_in`, a backend-specific counterpart to
+`Eter::resolve` that accepts a borrowed transaction. The caller is responsible
+for closing that transaction promptly; holding it open reintroduces the
+reader-table and freelist hazards described above. The per-`Eterator`
+resolution cache described in the Optional Caches section is an alternative
+that avoids open transactions entirely.
+
+### Configuration
+
+The backend constructor accepts two caller-supplied parameters.
+
+`map_size` sets the maximum size of the LMDB memory map in bytes. LMDB
+requires this value at environment open time and cannot grow the map
+automatically. If accumulated data exceeds `map_size`, subsequent writes
+return an error. Resizing requires calling `env.resize` with no active transactions of any
+kind (read or write); the caller is responsible for choosing a `map_size`
+large enough for the expected working set and for initiating resizes when
+needed. A safe default for small stores is 1 GiB; production deployments
+should size this according to data volume projections.
+
+The registered field list is the second parameter. The backend enumerates it
+at construction to open or create each named database and to derive `max_dbs`.
+Every `Field` type that will be passed to `resolve` or `WriteTxn::set` must
+appear in this list; an unregistered field type panics at call time.
+
+No other persistent global configuration exists on disk.
+
+### Version Registry
+
+The `_versions` database maps each committed version number (8-byte
+big-endian key) to an empty value. On each `WriteTxn::commit`, the new
+version is inserted into `_versions` within the same write transaction.
+`current_version` is a single backward cursor seek to the last key in
+`_versions`, executing in O(log n). `live_versions` scans `_versions` and
+subtracts `_retired`, both O(versions). `retired_versions` scans `_retired`,
+O(retired). These scans complete with LMDB page-cache efficiency and do not
+require a full field-table traversal.
+
+### Garbage Collection
+
+GC runs inside a single write transaction. It first scans the per-field
+databases to identify collectible rows per the algorithm in the Garbage
+Collection section, then deletes those rows and removes the corresponding
+version entries from `_versions` and `_retired`. Removing collected versions
+from `_versions` and `_retired` bounds the growth of both auxiliary tables to
+the number of live versions, not the total number of versions ever written.
+
+Deleted rows return their pages to LMDB's freelist; the database file does not
+shrink. To reclaim disk space after a GC pass, the caller must compact the
+environment by copying it to a new path with the compaction flag enabled
+(`MDB_CP_COMPACT` in LMDB terms; `heed` exposes this via its environment copy
+API). The backend does not automate this step; compaction is a blocking
+operation that requires no concurrent readers or writers.
 
