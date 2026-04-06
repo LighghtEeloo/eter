@@ -3,7 +3,8 @@
 Eter is a protocol for versioned graph storage with immutable snapshots.
 The interface is defined as Rust traits, backend-agnostic by design, with
 implementations ranging from filesystem-backed stores to concurrent database
-engines.
+engines. `Eter` stands for eternity, reflecting the protocol's core principle of
+immutable historical states.
 
 The basic idea is that the user does not mutate a database in place. Instead,
 the user works with stable "pointers" called `Eterator`s to immutable snapshots

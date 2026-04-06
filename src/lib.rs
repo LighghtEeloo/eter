@@ -358,6 +358,105 @@ pub trait Eter {
     fn live_versions(&self) -> Result<BTreeSet<Eterator>, Self::Error>;
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- Eterator --
+
+    #[test]
+    fn eterator_empty_has_version_zero() {
+        assert_eq!(Eterator::EMPTY.version(), 0);
+    }
+
+    #[test]
+    fn eterator_ordering_follows_version_number() {
+        let a = Eterator(1);
+        let b = Eterator(2);
+        assert!(a < b);
+        assert_eq!(a, a);
+    }
+
+    // -- Resolution --
+
+    #[test]
+    fn resolution_into_option_content() {
+        assert_eq!(Resolution::Content(42_u32).into_option(), Some(42));
+    }
+
+    #[test]
+    fn resolution_into_option_deleted_is_none() {
+        assert_eq!(Resolution::<u32>::Deleted.into_option(), None);
+    }
+
+    #[test]
+    fn resolution_into_option_absent_is_none() {
+        assert_eq!(Resolution::<u32>::Absent.into_option(), None);
+    }
+
+    #[test]
+    fn resolution_is_content_only_for_content_variant() {
+        assert!(Resolution::Content(1_u8).is_content());
+        assert!(!Resolution::<u8>::Deleted.is_content());
+        assert!(!Resolution::<u8>::Absent.is_content());
+    }
+
+    #[test]
+    fn resolution_is_absent_for_deleted_and_absent() {
+        assert!(!Resolution::Content(1_u8).is_absent());
+        assert!(Resolution::<u8>::Deleted.is_absent());
+        assert!(Resolution::<u8>::Absent.is_absent());
+    }
+
+    #[test]
+    fn resolution_map_transforms_content() {
+        let r: Resolution<u32> = Resolution::Content(3);
+        assert_eq!(r.map(|v| v * 2), Resolution::Content(6));
+    }
+
+    #[test]
+    fn resolution_map_preserves_deleted() {
+        let r: Resolution<u32> = Resolution::Deleted;
+        assert_eq!(r.map(|v| v * 2), Resolution::Deleted);
+    }
+
+    #[test]
+    fn resolution_map_preserves_absent() {
+        let r: Resolution<u32> = Resolution::Absent;
+        assert_eq!(r.map(|v| v * 2), Resolution::Absent);
+    }
+
+    // -- FieldRow --
+
+    #[test]
+    fn field_row_is_content_flag() {
+        assert!(FieldRow::Content(0_u8).is_content());
+        assert!(!FieldRow::<u8>::Deleted.is_content());
+    }
+
+    #[test]
+    fn field_row_map_transforms_content() {
+        assert_eq!(FieldRow::Content(10_u32).map(|v| v + 1), FieldRow::Content(11));
+    }
+
+    #[test]
+    fn field_row_map_preserves_deleted() {
+        assert_eq!(FieldRow::<u32>::Deleted.map(|v| v + 1), FieldRow::Deleted);
+    }
+
+    #[test]
+    fn field_row_into_resolution_content() {
+        let r: Resolution<u32> = FieldRow::Content(7).into();
+        assert_eq!(r, Resolution::Content(7));
+    }
+
+    #[test]
+    fn field_row_into_resolution_deleted() {
+        let r: Resolution<u32> = FieldRow::<u32>::Deleted.into();
+        assert_eq!(r, Resolution::Deleted);
+    }
+}
+
 // -- Optional cache traits --
 
 /// Optional trait for backends that cache the live-node set.

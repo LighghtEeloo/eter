@@ -633,3 +633,422 @@ where
         .with_field::<Lifecycle<L>>("lifecycle")
         .with_field::<Edges<FilesystemNodeId>>("edges")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Eter, Eterator, GcOption, Lifecycle, Resolution, WriteTxn};
+    use serde::{Deserialize, Serialize};
+
+    // -- Helpers --
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    enum State {
+        Active,
+    }
+
+    struct TagField;
+    impl Field for TagField {
+        type Content = String;
+    }
+
+    struct CountField;
+    impl Field for CountField {
+        type Content = u32;
+    }
+
+    fn open(path: impl Into<PathBuf>) -> FilesystemBackend<State> {
+        let registry = builtins_registry::<State>()
+            .with_field::<TagField>("tag")
+            .with_field::<CountField>("count");
+        FilesystemBackend::<State>::open(path, registry).unwrap()
+    }
+
+    fn node(s: &str) -> FilesystemNodeId {
+        FilesystemNodeId::new(s).unwrap()
+    }
+
+    // -- FilesystemNodeId --
+
+    #[test]
+    fn node_id_valid() {
+        assert!(FilesystemNodeId::new("hello").is_ok());
+        assert!(FilesystemNodeId::new("a-b_c.d").is_ok());
+        assert!(FilesystemNodeId::new("a".repeat(255)).is_ok());
+    }
+
+    #[test]
+    fn node_id_rejects_empty() {
+        assert!(FilesystemNodeId::new("").is_err());
+    }
+
+    #[test]
+    fn node_id_rejects_dot() {
+        assert!(FilesystemNodeId::new(".").is_err());
+        assert!(FilesystemNodeId::new("..").is_err());
+    }
+
+    #[test]
+    fn node_id_rejects_slash() {
+        assert!(FilesystemNodeId::new("a/b").is_err());
+    }
+
+    #[test]
+    fn node_id_rejects_null_byte() {
+        assert!(FilesystemNodeId::new("a\0b").is_err());
+    }
+
+    #[test]
+    fn node_id_rejects_too_long() {
+        assert!(FilesystemNodeId::new("a".repeat(256)).is_err());
+    }
+
+    #[test]
+    fn node_id_display_and_as_str_match() {
+        let id = FilesystemNodeId::new("mynode").unwrap();
+        assert_eq!(id.as_str(), "mynode");
+        assert_eq!(id.to_string(), "mynode");
+    }
+
+    #[test]
+    fn node_id_try_from_string() {
+        assert!(FilesystemNodeId::try_from("valid".to_owned()).is_ok());
+        assert!(FilesystemNodeId::try_from("".to_owned()).is_err());
+    }
+
+    // -- FilesystemFieldRegistry --
+
+    #[test]
+    fn registry_key_for_registered_field() {
+        let reg = builtins_registry::<State>();
+        assert_eq!(reg.key_for::<Lifecycle<State>>(), Some("lifecycle"));
+        assert_eq!(reg.key_for::<Edges<FilesystemNodeId>>(), Some("edges"));
+    }
+
+    #[test]
+    fn registry_key_for_unregistered_field_is_none() {
+        let reg = FilesystemFieldRegistry::new();
+        assert_eq!(reg.key_for::<TagField>(), None);
+    }
+
+    #[test]
+    fn registry_contains_after_registration() {
+        let reg = FilesystemFieldRegistry::new().with_field::<TagField>("tag");
+        assert!(reg.contains::<TagField>());
+    }
+
+    #[test]
+    fn registry_does_not_contain_unregistered() {
+        let reg = FilesystemFieldRegistry::new();
+        assert!(!reg.contains::<TagField>());
+    }
+
+    #[test]
+    #[should_panic(expected = "field type registered more than once")]
+    fn registry_panics_on_duplicate_type() {
+        FilesystemFieldRegistry::new()
+            .with_field::<TagField>("tag")
+            .with_field::<TagField>("tag2");
+    }
+
+    #[test]
+    #[should_panic(expected = "frontmatter key registered more than once")]
+    fn registry_panics_on_duplicate_key() {
+        FilesystemFieldRegistry::new()
+            .with_field::<TagField>("same")
+            .with_field::<CountField>("same");
+    }
+
+    #[test]
+    #[should_panic(expected = "filesystem field key must not be empty")]
+    fn registry_panics_on_empty_key() {
+        FilesystemFieldRegistry::new().with_field::<TagField>("");
+    }
+
+    // -- Snapshot encode / decode --
+
+    #[test]
+    fn encode_decode_roundtrip() {
+        let mut header = serde_json::Map::new();
+        header.insert("lifecycle".to_owned(), serde_json::json!("Active"));
+        header.insert("count".to_owned(), serde_json::json!(7));
+        let body = "some **markdown** text";
+
+        let encoded = FilesystemBackend::<State>::encode_snapshot(&header, body).unwrap();
+        let (decoded_header, decoded_body) =
+            FilesystemBackend::<State>::decode_snapshot(&encoded).unwrap();
+
+        assert_eq!(decoded_header, header);
+        // encode_snapshot emits "---\n{json}\n---\n\n{body}", so the decoded body
+        // has a leading newline (the blank line separating frontmatter from content).
+        assert_eq!(decoded_body, format!("\n{body}"));
+    }
+
+    #[test]
+    fn encode_decode_null_deletion_marker() {
+        let mut header = serde_json::Map::new();
+        header.insert("tag".to_owned(), serde_json::Value::Null);
+        let encoded = FilesystemBackend::<State>::encode_snapshot(&header, "").unwrap();
+        let (decoded, _) = FilesystemBackend::<State>::decode_snapshot(&encoded).unwrap();
+        assert!(decoded["tag"].is_null());
+    }
+
+    #[test]
+    fn decode_snapshot_rejects_missing_prefix() {
+        assert!(FilesystemBackend::<State>::decode_snapshot("no frontmatter").is_err());
+    }
+
+    #[test]
+    fn decode_snapshot_rejects_missing_closing_delimiter() {
+        assert!(FilesystemBackend::<State>::decode_snapshot("---\n{}").is_err());
+    }
+
+    #[test]
+    fn decode_snapshot_rejects_invalid_json() {
+        assert!(FilesystemBackend::<State>::decode_snapshot("---\nnot json\n---\n").is_err());
+    }
+
+    // -- Filename parsing --
+
+    #[test]
+    fn parse_versioned_filename_valid() {
+        let id = node("alpha");
+        let v = FilesystemBackend::<State>::parse_versioned_filename(
+            "000000000000000f-alpha.md",
+            &id,
+        )
+        .unwrap();
+        assert_eq!(v, Eterator(15));
+    }
+
+    #[test]
+    fn parse_versioned_filename_wrong_node_suffix() {
+        let id = node("alpha");
+        assert!(FilesystemBackend::<State>::parse_versioned_filename(
+            "000000000000000f-beta.md",
+            &id,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn parse_versioned_filename_wrong_hex_length() {
+        let id = node("alpha");
+        assert!(FilesystemBackend::<State>::parse_versioned_filename(
+            "000f-alpha.md",
+            &id,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn parse_versioned_filename_non_hex_version() {
+        let id = node("alpha");
+        assert!(FilesystemBackend::<State>::parse_versioned_filename(
+            "zzzzzzzzzzzzzzzz-alpha.md",
+            &id,
+        )
+        .is_err());
+    }
+
+    // -- open() --
+
+    #[test]
+    #[should_panic(expected = "filesystem backend requires Lifecycle field registration")]
+    fn open_panics_without_lifecycle_field() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = FilesystemFieldRegistry::new();
+        FilesystemBackend::<State>::open(temp.path(), registry).unwrap();
+    }
+
+    #[test]
+    fn open_creates_root_directory_if_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let subdir = temp.path().join("new_store");
+        assert!(!subdir.exists());
+        let _ = open(&subdir);
+        assert!(subdir.is_dir());
+    }
+
+    #[test]
+    fn open_fails_when_root_is_a_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let file_path = temp.path().join("not_a_dir");
+        std::fs::write(&file_path, b"").unwrap();
+        let registry = builtins_registry::<State>();
+        assert!(FilesystemBackend::<State>::open(&file_path, registry).is_err());
+    }
+
+    // -- write / resolve / current_version --
+
+    #[test]
+    fn write_and_resolve_single_field() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = open(temp.path());
+        let a = node("a");
+        let v1 = store
+            .write()
+            .set::<Lifecycle<State>>(&a, State::Active)
+            .set::<TagField>(&a, "hello".to_owned())
+            .commit()
+            .unwrap();
+        assert_eq!(
+            store.resolve::<TagField>(v1, &a).unwrap(),
+            Resolution::Content("hello".to_owned())
+        );
+    }
+
+    #[test]
+    fn current_version_advances_on_each_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = open(temp.path());
+        let a = node("a");
+        assert_eq!(store.current_version().unwrap(), Eterator::EMPTY);
+        let v1 = store
+            .write()
+            .set::<Lifecycle<State>>(&a, State::Active)
+            .commit()
+            .unwrap();
+        let v2 = store
+            .write()
+            .set::<TagField>(&a, "x".to_owned())
+            .commit()
+            .unwrap();
+        assert!(Eterator::EMPTY < v1);
+        assert!(v1 < v2);
+        assert_eq!(store.current_version().unwrap(), v2);
+    }
+
+    #[test]
+    fn resolve_deleted_field_returns_deleted() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = open(temp.path());
+        let a = node("a");
+        store
+            .write()
+            .set::<Lifecycle<State>>(&a, State::Active)
+            .set::<TagField>(&a, "x".to_owned())
+            .commit()
+            .unwrap();
+        let v2 = store.write().delete::<TagField>(&a).commit().unwrap();
+        assert_eq!(store.resolve::<TagField>(v2, &a).unwrap(), Resolution::Deleted);
+    }
+
+    // -- node_id_in_use --
+
+    #[test]
+    fn node_id_in_use_false_before_any_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = open(temp.path());
+        assert!(!store.node_id_in_use(&node("x")).unwrap());
+    }
+
+    #[test]
+    fn node_id_in_use_true_after_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = open(temp.path());
+        let a = node("a");
+        store
+            .write()
+            .set::<Lifecycle<State>>(&a, State::Active)
+            .commit()
+            .unwrap();
+        assert!(store.node_id_in_use(&a).unwrap());
+    }
+
+    // -- retire / only_keep / live_versions / retired_versions --
+
+    #[test]
+    fn retire_adds_to_retired_set() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = open(temp.path());
+        let a = node("a");
+        let v1 = store
+            .write()
+            .set::<Lifecycle<State>>(&a, State::Active)
+            .commit()
+            .unwrap();
+        store.retire([v1]).unwrap();
+        assert!(store.retired_versions().unwrap().contains(&v1));
+    }
+
+    #[test]
+    fn only_keep_retires_all_others() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = open(temp.path());
+        let a = node("a");
+        let v1 = store
+            .write()
+            .set::<Lifecycle<State>>(&a, State::Active)
+            .commit()
+            .unwrap();
+        let v2 = store.write().set::<TagField>(&a, "t".to_owned()).commit().unwrap();
+        store.only_keep([v2]).unwrap();
+        let retired = store.retired_versions().unwrap();
+        assert!(retired.contains(&v1));
+        assert!(!retired.contains(&v2));
+    }
+
+    #[test]
+    fn live_versions_is_complement_of_retired() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = open(temp.path());
+        let a = node("a");
+        let v1 = store
+            .write()
+            .set::<Lifecycle<State>>(&a, State::Active)
+            .commit()
+            .unwrap();
+        let v2 = store.write().set::<TagField>(&a, "t".to_owned()).commit().unwrap();
+        store.retire([v1]).unwrap();
+        let live = store.live_versions().unwrap();
+        assert!(!live.contains(&v1));
+        assert!(live.contains(&v2));
+    }
+
+    // -- gc --
+
+    #[test]
+    fn gc_use_retired_set_removes_redundant_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = open(temp.path());
+        let a = node("a");
+        let v1 = store
+            .write()
+            .set::<Lifecycle<State>>(&a, State::Active)
+            .set::<CountField>(&a, 1)
+            .commit()
+            .unwrap();
+        let v2 = store.write().set::<CountField>(&a, 2).commit().unwrap();
+        store.retire([v1]).unwrap();
+        store.gc(GcOption::UseRetiredSet).unwrap();
+        // v1 file is gone; reading at v2 still works.
+        assert_eq!(
+            store.resolve::<CountField>(v2, &a).unwrap(),
+            Resolution::Content(2)
+        );
+        assert!(store.field_history::<CountField>(&a).unwrap().len() == 1);
+    }
+
+    #[test]
+    fn gc_use_live_set_does_not_alter_live_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = open(temp.path());
+        let a = node("a");
+        let v1 = store
+            .write()
+            .set::<Lifecycle<State>>(&a, State::Active)
+            .set::<CountField>(&a, 10)
+            .commit()
+            .unwrap();
+        let v2 = store.write().set::<CountField>(&a, 20).commit().unwrap();
+        store.gc(GcOption::UseLiveSet(std::collections::BTreeSet::from([v2]))).unwrap();
+        assert_eq!(
+            store.resolve::<CountField>(v2, &a).unwrap(),
+            Resolution::Content(20)
+        );
+        // v1 is now unreachable; its row was removed.
+        let hist = store.field_history::<CountField>(&a).unwrap();
+        assert!(!hist.iter().any(|(v, _)| *v == v1));
+    }
+}
