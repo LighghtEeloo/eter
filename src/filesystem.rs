@@ -3,7 +3,7 @@
 //! Storage layout:
 //! - `<root>/<node_id>/<version>-<node_id>.md`
 //! - `version` is a 64-bit value encoded as 16 lowercase hex digits.
-//! - each file contains JSON frontmatter and a markdown body.
+//! - each file contains YAML frontmatter and a markdown body.
 //!
 //! Frontmatter stores protocol fields by key. A `null` value is a
 //! [`FieldRow::Deleted`](crate::FieldRow::Deleted) marker, while an absent key
@@ -109,7 +109,7 @@ impl FilesystemFieldRegistry {
 
     /// Register a field type with a frontmatter key.
     ///
-    /// The key is the exact JSON frontmatter key used for this field in every
+    /// The key is the exact YAML frontmatter key used for this field in every
     /// version file.
     ///
     /// # Panics
@@ -231,17 +231,17 @@ where
     }
 
     fn encode_snapshot(header: &Map<String, Value>, body: &str) -> Result<String, FilesystemError> {
-        let json = serde_json::to_string_pretty(header)?;
-        Ok(format!("---\n{json}\n---\n\n{body}"))
+        let yaml = serde_yaml::to_string(header)?;
+        Ok(format!("---\n{yaml}---\n\n{body}"))
     }
 
     fn decode_snapshot(text: &str) -> Result<(Map<String, Value>, String), FilesystemError> {
         let rest = text.strip_prefix("---\n").ok_or(FilesystemError::InvalidFrontmatter)?;
         let sep = "\n---\n";
         let idx = rest.find(sep).ok_or(FilesystemError::InvalidFrontmatter)?;
-        let json = &rest[..idx];
+        let yaml = &rest[..idx];
         let body = &rest[idx + sep.len()..];
-        let header: Map<String, Value> = serde_json::from_str(json)?;
+        let header: Map<String, Value> = serde_yaml::from_str(yaml)?;
         Ok((header, body.to_owned()))
     }
 
@@ -365,9 +365,12 @@ pub enum FilesystemError {
     /// Filesystem I/O error.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    /// JSON serialization or deserialization error.
+    /// JSON field serialization or deserialization error.
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    /// YAML frontmatter serialization or deserialization error.
+    #[error("yaml error: {0}")]
+    Yaml(#[from] serde_yaml::Error),
 }
 
 /// Write transaction for [`FilesystemBackend`].
@@ -777,7 +780,11 @@ mod tests {
             FilesystemBackend::<State>::decode_snapshot(&encoded).unwrap();
 
         assert_eq!(decoded_header, header);
-        // encode_snapshot emits "---\n{json}\n---\n\n{body}", so the decoded body
+        assert!(encoded.contains("\ncount: 7\n"));
+        assert!(encoded.contains("\nlifecycle: Active\n"));
+        assert!(!encoded.contains("\"count\""));
+
+        // encode_snapshot emits "---\n{yaml}---\n\n{body}", so the decoded body
         // has a leading newline (the blank line separating frontmatter from content).
         assert_eq!(decoded_body, format!("\n{body}"));
     }
@@ -802,8 +809,8 @@ mod tests {
     }
 
     #[test]
-    fn decode_snapshot_rejects_invalid_json() {
-        assert!(FilesystemBackend::<State>::decode_snapshot("---\nnot json\n---\n").is_err());
+    fn decode_snapshot_rejects_invalid_yaml() {
+        assert!(FilesystemBackend::<State>::decode_snapshot("---\nnot: [closed\n---\n").is_err());
     }
 
     // -- Filename parsing --

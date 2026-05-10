@@ -246,21 +246,21 @@ memory and rebuilt from the file tree on startup.
 
 ### File Format
 
-Each version file uses JSON frontmatter delimited by `---`, followed by a
+Each version file uses YAML frontmatter delimited by `---`, followed by a
 markdown body:
 
 ```md
 ---
-{
-  "lifecycle": "active",
-  "edges": ["target_a", "target_b"]
-}
+lifecycle: active
+edges:
+  - target_a
+  - target_b
 ---
 
 Body text in markdown.
 ```
 
-The JSON object holds all structured fields: `lifecycle`, `edges`, and any
+The YAML mapping holds all structured fields: `lifecycle`, `edges`, and any
 user-defined fields registered with the backend. Registration is static:
 user-defined `Field` types are fixed at compile time and mapped to keys when
 the backend is constructed. A key set to `null` represents a deletion
@@ -279,7 +279,7 @@ No additional hidden metadata exists for this backend.
 
 The markdown text after the closing delimiter is the node's body, a
 privileged content field specific to this backend. It has no representation
-in the JSON header.
+in the YAML header.
 
 ### Protocol Mapping
 
@@ -290,7 +290,7 @@ is more storage on partial updates in exchange for simpler resolution,
 atomic per-node snapshots, and human-readable files.
 
 **resolve.** Scan filenames in `<root>/<node_id>/`, find the file with the
-largest hex version ≤ the queried `Eterator`, parse the JSON header, and
+largest hex version ≤ the queried `Eterator`, parse the YAML header, and
 return the requested field. For the body field, return the markdown text.
 
 **write.** Assign the next version (one greater than the current maximum).
