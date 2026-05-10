@@ -239,7 +239,7 @@ where
         let sep = "\n---\n";
         let idx = rest.find(sep).ok_or(FilesystemError::InvalidFrontmatter)?;
         let yaml = &rest[..idx];
-        let body = &rest[idx + sep.len()..];
+        let body = rest[idx + sep.len()..].strip_prefix('\n').unwrap_or(&rest[idx + sep.len()..]);
         let header: Map<String, Value> = serde_yaml::from_str(yaml)?;
         Ok((header, body.to_owned()))
     }
@@ -345,6 +345,24 @@ where
             .key_for::<F>()
             .unwrap_or_else(|| panic!("field type is not registered in filesystem backend"))
     }
+
+    /// Resolve the markdown body for an entry at a given snapshot.
+    ///
+    /// Returns the body from the newest version file whose version is less
+    /// than or equal to `at`. Unlike frontmatter fields, the body has no
+    /// deletion marker; an existing snapshot always resolves to content.
+    pub fn resolve_body(
+        &self, at: Eterator, entry: &FilesystemEntryId,
+    ) -> Result<Resolution<String>, FilesystemError> {
+        trace!("filesystem resolve_body begin: at={} entry={entry}", at.version());
+        FilesystemEntryId::validate(entry.as_str())?;
+        let result = match self.latest_snapshot_at(entry, at)? {
+            | Some((_, _, body)) => Resolution::Content(body),
+            | None => Resolution::Absent,
+        };
+        trace!("filesystem resolve_body end");
+        Ok(result)
+    }
 }
 
 /// Error type for filesystem backend operations.
@@ -385,7 +403,34 @@ where
     L: Clone + Debug + Serialize + DeserializeOwned + 'static,
 {
     store: &'a mut FilesystemBackend<L>,
-    pending: BTreeMap<FilesystemEntryId, BTreeMap<String, FieldRow<Value>>>,
+    pending: BTreeMap<FilesystemEntryId, PendingSnapshot>,
+}
+
+#[derive(Debug, Default)]
+struct PendingSnapshot {
+    fields: BTreeMap<String, FieldRow<Value>>,
+    body: Option<String>,
+}
+
+impl<'a, L> FilesystemWriteTxn<'a, L>
+where
+    L: Clone + Debug + Serialize + DeserializeOwned + 'static,
+{
+    /// Replace the markdown body for an entry in this transaction.
+    ///
+    /// Body text is inherited from the previous snapshot when a transaction
+    /// only changes frontmatter fields. Calling this method writes the supplied
+    /// body at the transaction's committed version.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `entry` does not satisfy filesystem entry id invariants.
+    pub fn set_body(mut self, entry: &FilesystemEntryId, body: impl Into<String>) -> Self {
+        FilesystemEntryId::validate(entry.as_str())
+            .unwrap_or_else(|err| panic!("invalid entry id in write transaction: {err}"));
+        self.pending.entry(entry.clone()).or_default().body = Some(body.into());
+        self
+    }
 }
 
 impl<'a, L> WriteTxn for FilesystemWriteTxn<'a, L>
@@ -409,7 +454,7 @@ where
             | FieldRow::Deleted => FieldRow::Deleted,
         };
 
-        self.pending.entry(entry.clone()).or_default().insert(key, encoded);
+        self.pending.entry(entry.clone()).or_default().fields.insert(key, encoded);
         self
     }
 
@@ -427,7 +472,7 @@ where
                 | Some((_, h, b)) => (h, b),
                 | None => (Map::new(), String::new()),
             };
-            for (key, row) in updates {
+            for (key, row) in updates.fields {
                 match row {
                     | FieldRow::Content(value) => {
                         header.insert(key, value);
@@ -437,6 +482,7 @@ where
                     }
                 }
             }
+            let body = updates.body.unwrap_or(body);
             self.store.write_snapshot(&entry, next, &header, &body)?;
         }
         self.store.current = next;
@@ -762,9 +808,7 @@ mod tests {
         assert!(encoded.contains("\nlifecycle: Active\n"));
         assert!(!encoded.contains("\"count\""));
 
-        // encode_snapshot emits "---\n{yaml}---\n\n{body}", so the decoded body
-        // has a leading newline (the blank line separating frontmatter from content).
-        assert_eq!(decoded_body, format!("\n{body}"));
+        assert_eq!(decoded_body, body);
     }
 
     #[test]
@@ -901,6 +945,55 @@ mod tests {
             .unwrap();
         let v2 = store.write().delete::<TagField>(&a).commit().unwrap();
         assert_eq!(store.resolve::<TagField>(v2, &a).unwrap(), Resolution::Deleted);
+    }
+
+    #[test]
+    fn write_and_resolve_body() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = open(temp.path());
+        let a = entry("a");
+        let body = "some **markdown** text";
+        let v1 = store
+            .write()
+            .set::<Lifecycle<State>>(&a, State::Active)
+            .set_body(&a, body)
+            .commit()
+            .unwrap();
+        assert_eq!(store.resolve_body(v1, &a).unwrap(), Resolution::Content(body.to_owned()));
+    }
+
+    #[test]
+    fn field_update_inherits_body_without_extra_blank_lines() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = open(temp.path());
+        let a = entry("a");
+        let body = "body line";
+        store
+            .write()
+            .set::<Lifecycle<State>>(&a, State::Active)
+            .set_body(&a, body)
+            .commit()
+            .unwrap();
+        let v2 = store.write().set::<TagField>(&a, "tag".to_owned()).commit().unwrap();
+        assert_eq!(store.resolve_body(v2, &a).unwrap(), Resolution::Content(body.to_owned()));
+    }
+
+    #[test]
+    fn body_update_inherits_frontmatter() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = open(temp.path());
+        let a = entry("a");
+        store
+            .write()
+            .set::<Lifecycle<State>>(&a, State::Active)
+            .set::<TagField>(&a, "tag".to_owned())
+            .commit()
+            .unwrap();
+        let v2 = store.write().set_body(&a, "body").commit().unwrap();
+        assert_eq!(
+            store.resolve::<TagField>(v2, &a).unwrap(),
+            Resolution::Content("tag".to_owned())
+        );
     }
 
     // -- entry_id_in_use --
