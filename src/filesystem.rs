@@ -1,7 +1,7 @@
 //! Filesystem backend for the Eter protocol.
 //!
 //! Storage layout:
-//! - `<root>/<node_id>/<version>-<node_id>.md`
+//! - `<root>/<entry_id>/<version>-<entry_id>.md`
 //! - `version` is a 64-bit value encoded as 16 lowercase hex digits.
 //! - each file contains YAML frontmatter and a markdown body.
 //!
@@ -9,7 +9,7 @@
 //! [`FieldRow::Deleted`](crate::FieldRow::Deleted) marker, while an absent key
 //! means the field is inherited from older snapshots during resolution.
 //!
-//! This backend stores one markdown file per `(NodeId, version)` snapshot. It
+//! This backend stores one markdown file per `(EntryId, version)` snapshot. It
 //! keeps no persistent retired-version state on disk. Retired/live version
 //! bookkeeping is in memory and controlled by callers through [`crate::GcOption`].
 
@@ -26,22 +26,21 @@ use thiserror::Error;
 use tracing::trace;
 
 use crate::{
-    Edges, Eter, Eterator, Field, FieldRow, GcOption, Lifecycle, Resolution, VersionedRow, Warning,
-    WriteTxn,
+    Eter, Eterator, Field, FieldRow, GcOption, Lifecycle, Resolution, VersionedRow, WriteTxn,
 };
 
 type DecodedSnapshot = (Eterator, Map<String, Value>, String);
 
-/// Filesystem-native node identifier.
+/// Filesystem-native entry identifier.
 ///
 /// This type enforces path-safety invariants required by directory-backed
 /// storage and avoids using raw `String` as protocol identity.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct FilesystemNodeId(String);
+pub struct FilesystemEntryId(String);
 
-impl FilesystemNodeId {
-    /// Construct a validated filesystem node id.
+impl FilesystemEntryId {
+    /// Construct a validated filesystem entry id.
     pub fn new(raw: impl Into<String>) -> Result<Self, FilesystemError> {
         let raw = raw.into();
         Self::validate(&raw)?;
@@ -53,33 +52,33 @@ impl FilesystemNodeId {
         &self.0
     }
 
-    fn validate(node: &str) -> Result<(), FilesystemError> {
-        if node.is_empty() || node == "." || node == ".." {
-            return Err(FilesystemError::InvalidNodeId(node.to_owned()));
+    fn validate(entry: &str) -> Result<(), FilesystemError> {
+        if entry.is_empty() || entry == "." || entry == ".." {
+            return Err(FilesystemError::InvalidEntryId(entry.to_owned()));
         }
-        if node.contains('/') || node.contains('\0') {
-            return Err(FilesystemError::InvalidNodeId(node.to_owned()));
+        if entry.contains('/') || entry.contains('\0') {
+            return Err(FilesystemError::InvalidEntryId(entry.to_owned()));
         }
-        if node.len() > 255 {
-            return Err(FilesystemError::InvalidNodeId(node.to_owned()));
+        if entry.len() > 255 {
+            return Err(FilesystemError::InvalidEntryId(entry.to_owned()));
         }
         Ok(())
     }
 }
 
-impl std::fmt::Display for FilesystemNodeId {
+impl std::fmt::Display for FilesystemEntryId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(&self.0, f)
     }
 }
 
-impl AsRef<str> for FilesystemNodeId {
+impl AsRef<str> for FilesystemEntryId {
     fn as_ref(&self) -> &str {
         self.as_str()
     }
 }
 
-impl TryFrom<String> for FilesystemNodeId {
+impl TryFrom<String> for FilesystemEntryId {
     type Error = FilesystemError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
@@ -142,12 +141,12 @@ impl FilesystemFieldRegistry {
 
 /// Filesystem backend implementation of [`Eter`].
 ///
-/// `NodeId` is represented as [`FilesystemNodeId`] and validated for path safety.
+/// `EntryId` is represented as [`FilesystemEntryId`] and validated for path safety.
 /// `Lifecycle` state type is user-defined.
 ///
-/// A write creates a full node snapshot at the next global version: updated
+/// A write creates a full entry snapshot at the next global version: updated
 /// fields are written from the transaction and unchanged fields are copied from
-/// the latest earlier snapshot for that node.
+/// the latest earlier snapshot for that entry.
 #[derive(Debug)]
 pub struct FilesystemBackend<L>
 where
@@ -208,14 +207,14 @@ where
         })
     }
 
-    fn node_dir(&self, node: &FilesystemNodeId) -> PathBuf {
-        self.root.join(node.as_str())
+    fn entry_dir(&self, entry: &FilesystemEntryId) -> PathBuf {
+        self.root.join(entry.as_str())
     }
 
     fn parse_versioned_filename(
-        name: &str, node: &FilesystemNodeId,
+        name: &str, entry: &FilesystemEntryId,
     ) -> Result<Eterator, FilesystemError> {
-        let expected_suffix = format!("-{}.md", node.as_str());
+        let expected_suffix = format!("-{}.md", entry.as_str());
         if !name.ends_with(&expected_suffix) {
             return Err(FilesystemError::InvalidFilename(name.to_owned()));
         }
@@ -245,31 +244,31 @@ where
         Ok((header, body.to_owned()))
     }
 
-    fn list_node_versions(
-        &self, node: &FilesystemNodeId,
+    fn list_entry_versions(
+        &self, entry: &FilesystemEntryId,
     ) -> Result<Vec<(Eterator, PathBuf)>, FilesystemError> {
-        let dir = self.node_dir(node);
+        let dir = self.entry_dir(entry);
         if !dir.exists() {
             return Ok(Vec::new());
         }
         let mut out = Vec::new();
-        for entry in fs::read_dir(&dir)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_file() {
+        for dir_entry in fs::read_dir(&dir)? {
+            let dir_entry = dir_entry?;
+            if !dir_entry.file_type()?.is_file() {
                 continue;
             }
-            let name = entry.file_name().to_string_lossy().to_string();
-            let version = Self::parse_versioned_filename(&name, node)?;
-            out.push((version, entry.path()));
+            let name = dir_entry.file_name().to_string_lossy().to_string();
+            let version = Self::parse_versioned_filename(&name, entry)?;
+            out.push((version, dir_entry.path()));
         }
         out.sort_by_key(|(version, _)| *version);
         Ok(out)
     }
 
     fn latest_snapshot_at(
-        &self, node: &FilesystemNodeId, at: Eterator,
+        &self, entry: &FilesystemEntryId, at: Eterator,
     ) -> Result<Option<DecodedSnapshot>, FilesystemError> {
-        let versions = self.list_node_versions(node)?;
+        let versions = self.list_entry_versions(entry)?;
         let candidate = versions.into_iter().rev().find(|(version, _)| *version <= at);
         if let Some((version, path)) = candidate {
             let text = fs::read_to_string(path)?;
@@ -281,24 +280,26 @@ where
     }
 
     fn write_snapshot(
-        &self, node: &FilesystemNodeId, version: Eterator, header: &Map<String, Value>, body: &str,
+        &self, entry: &FilesystemEntryId, version: Eterator, header: &Map<String, Value>,
+        body: &str,
     ) -> Result<(), FilesystemError> {
-        let dir = self.node_dir(node);
+        let dir = self.entry_dir(entry);
         fs::create_dir_all(&dir)?;
-        let filename = format!("{:016x}-{}.md", version.version(), node.as_str());
+        let filename = format!("{:016x}-{}.md", version.version(), entry.as_str());
         let path = dir.join(filename);
         let text = Self::encode_snapshot(header, body)?;
         fs::write(path, text)?;
         Ok(())
     }
 
-    fn scan_node_ids(&self) -> Result<Vec<FilesystemNodeId>, FilesystemError> {
+    fn scan_entry_ids(&self) -> Result<Vec<FilesystemEntryId>, FilesystemError> {
         let mut ids = Vec::new();
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
             if entry.file_type()?.is_dir() {
-                let node = FilesystemNodeId::new(entry.file_name().to_string_lossy().to_string())?;
-                ids.push(node);
+                let entry =
+                    FilesystemEntryId::new(entry.file_name().to_string_lossy().to_string())?;
+                ids.push(entry);
             }
         }
         ids.sort();
@@ -307,19 +308,20 @@ where
 
     fn scan_current_version(root: &Path) -> Result<Eterator, FilesystemError> {
         let mut max = Eterator::EMPTY;
-        for node_entry in fs::read_dir(root)? {
-            let node_entry = node_entry?;
-            if !node_entry.file_type()?.is_dir() {
+        for root_entry in fs::read_dir(root)? {
+            let root_entry = root_entry?;
+            if !root_entry.file_type()?.is_dir() {
                 continue;
             }
-            let node = FilesystemNodeId::new(node_entry.file_name().to_string_lossy().to_string())?;
-            for file_entry in fs::read_dir(node_entry.path())? {
+            let entry =
+                FilesystemEntryId::new(root_entry.file_name().to_string_lossy().to_string())?;
+            for file_entry in fs::read_dir(root_entry.path())? {
                 let file_entry = file_entry?;
                 if !file_entry.file_type()?.is_file() {
                     continue;
                 }
                 let name = file_entry.file_name().to_string_lossy().to_string();
-                let version = Self::parse_versioned_filename(&name, &node)?;
+                let version = Self::parse_versioned_filename(&name, &entry)?;
                 if version > max {
                     max = version;
                 }
@@ -330,8 +332,8 @@ where
 
     fn all_versions(&self) -> Result<BTreeSet<Eterator>, FilesystemError> {
         let mut versions = BTreeSet::new();
-        for node in self.scan_node_ids()? {
-            for (version, _) in self.list_node_versions(&node)? {
+        for entry in self.scan_entry_ids()? {
+            for (version, _) in self.list_entry_versions(&entry)? {
                 versions.insert(version);
             }
         }
@@ -353,10 +355,10 @@ pub enum FilesystemError {
     /// The store root path is not a directory.
     #[error("invalid store root: {0}")]
     InvalidStoreRoot(PathBuf),
-    /// Node identifier cannot be represented as a safe directory name.
-    #[error("invalid node id: {0}")]
-    InvalidNodeId(String),
-    /// Version filename does not match `<version>-<node_id>.md`.
+    /// Entry identifier cannot be represented as a safe directory name.
+    #[error("invalid entry id: {0}")]
+    InvalidEntryId(String),
+    /// Version filename does not match `<version>-<entry_id>.md`.
     #[error("invalid version filename: {0}")]
     InvalidFilename(String),
     /// Markdown frontmatter is malformed.
@@ -375,7 +377,7 @@ pub enum FilesystemError {
 
 /// Write transaction for [`FilesystemBackend`].
 ///
-/// The transaction accumulates per-node field updates. On commit, all updates
+/// The transaction accumulates per-entry field updates. On commit, all updates
 /// are materialized at one shared version and written as markdown snapshot
 /// files.
 pub struct FilesystemWriteTxn<'a, L>
@@ -383,19 +385,19 @@ where
     L: Clone + Debug + Serialize + DeserializeOwned + 'static,
 {
     store: &'a mut FilesystemBackend<L>,
-    pending: BTreeMap<FilesystemNodeId, BTreeMap<String, FieldRow<Value>>>,
+    pending: BTreeMap<FilesystemEntryId, BTreeMap<String, FieldRow<Value>>>,
 }
 
 impl<'a, L> WriteTxn for FilesystemWriteTxn<'a, L>
 where
     L: Clone + Debug + Serialize + DeserializeOwned + 'static,
 {
-    type NodeId = FilesystemNodeId;
+    type EntryId = FilesystemEntryId;
     type Error = FilesystemError;
 
-    fn apply<F: Field>(mut self, node: &Self::NodeId, row: FieldRow<F::Content>) -> Self {
-        FilesystemNodeId::validate(node.as_str())
-            .unwrap_or_else(|err| panic!("invalid node id in write transaction: {err}"));
+    fn apply<F: Field>(mut self, entry: &Self::EntryId, row: FieldRow<F::Content>) -> Self {
+        FilesystemEntryId::validate(entry.as_str())
+            .unwrap_or_else(|err| panic!("invalid entry id in write transaction: {err}"));
 
         let key = self.store.field_key_or_panic::<F>().to_owned();
         let encoded = match row {
@@ -407,20 +409,20 @@ where
             | FieldRow::Deleted => FieldRow::Deleted,
         };
 
-        self.pending.entry(node.clone()).or_default().insert(key, encoded);
+        self.pending.entry(entry.clone()).or_default().insert(key, encoded);
         self
     }
 
     fn commit(self) -> Result<Eterator, Self::Error> {
-        trace!("filesystem commit begin: nodes={}", self.pending.len());
+        trace!("filesystem commit begin: entries={}", self.pending.len());
         if self.pending.is_empty() {
             trace!("filesystem commit end: no-op");
             return Ok(self.store.current);
         }
 
         let next = Eterator(self.store.current.version() + 1);
-        for (node, updates) in self.pending {
-            let previous = self.store.latest_snapshot_at(&node, self.store.current)?;
+        for (entry, updates) in self.pending {
+            let previous = self.store.latest_snapshot_at(&entry, self.store.current)?;
             let (mut header, body) = match previous {
                 | Some((_, h, b)) => (h, b),
                 | None => (Map::new(), String::new()),
@@ -435,7 +437,7 @@ where
                     }
                 }
             }
-            self.store.write_snapshot(&node, next, &header, &body)?;
+            self.store.write_snapshot(&entry, next, &header, &body)?;
         }
         self.store.current = next;
         trace!("filesystem commit end: version={}", next.version());
@@ -447,7 +449,7 @@ impl<L> Eter for FilesystemBackend<L>
 where
     L: Clone + Debug + Serialize + DeserializeOwned + 'static,
 {
-    type NodeId = FilesystemNodeId;
+    type EntryId = FilesystemEntryId;
     type Lifecycle = L;
     type Error = FilesystemError;
     type WriteTxn<'a>
@@ -456,12 +458,12 @@ where
         Self: 'a;
 
     fn resolve<F: Field>(
-        &self, at: Eterator, node: &Self::NodeId,
+        &self, at: Eterator, entry: &Self::EntryId,
     ) -> Result<Resolution<F::Content>, Self::Error> {
-        trace!("filesystem resolve begin: at={} node={node}", at.version());
-        FilesystemNodeId::validate(node.as_str())?;
+        trace!("filesystem resolve begin: at={} entry={entry}", at.version());
+        FilesystemEntryId::validate(entry.as_str())?;
         let key = self.field_key_or_panic::<F>();
-        let result = match self.latest_snapshot_at(node, at)? {
+        let result = match self.latest_snapshot_at(entry, at)? {
             | Some((_, header, _)) => match header.get(key) {
                 | Some(value) if value.is_null() => Resolution::Deleted,
                 | Some(value) => Resolution::Content(serde_json::from_value(value.clone())?),
@@ -473,10 +475,10 @@ where
         Ok(result)
     }
 
-    fn node_exists(&self, at: Eterator, node: &Self::NodeId) -> Result<bool, Self::Error> {
-        trace!("filesystem node_exists begin: at={} node={node}", at.version());
-        let exists = self.resolve::<Lifecycle<L>>(at, node)?.is_content();
-        trace!("filesystem node_exists end: exists={exists}");
+    fn entry_exists(&self, at: Eterator, entry: &Self::EntryId) -> Result<bool, Self::Error> {
+        trace!("filesystem entry_exists begin: at={} entry={entry}", at.version());
+        let exists = self.resolve::<Lifecycle<L>>(at, entry)?.is_content();
+        trace!("filesystem entry_exists end: exists={exists}");
         Ok(exists)
     }
 
@@ -486,13 +488,13 @@ where
     }
 
     fn field_history<F: Field>(
-        &self, node: &Self::NodeId,
+        &self, entry: &Self::EntryId,
     ) -> Result<Vec<VersionedRow<F::Content>>, Self::Error> {
-        trace!("filesystem field_history begin: node={node}");
-        FilesystemNodeId::validate(node.as_str())?;
+        trace!("filesystem field_history begin: entry={entry}");
+        FilesystemEntryId::validate(entry.as_str())?;
         let key = self.field_key_or_panic::<F>();
         let mut out = Vec::new();
-        for (version, path) in self.list_node_versions(node)? {
+        for (version, path) in self.list_entry_versions(entry)? {
             let text = fs::read_to_string(path)?;
             let (header, _) = Self::decode_snapshot(&text)?;
             if let Some(value) = header.get(key) {
@@ -508,12 +510,12 @@ where
         Ok(out)
     }
 
-    fn node_id_in_use(&self, id: &Self::NodeId) -> Result<bool, Self::Error> {
-        trace!("filesystem node_id_in_use begin: id={id}");
-        FilesystemNodeId::validate(id.as_str())?;
-        let dir = self.node_dir(id);
+    fn entry_id_in_use(&self, id: &Self::EntryId) -> Result<bool, Self::Error> {
+        trace!("filesystem entry_id_in_use begin: id={id}");
+        FilesystemEntryId::validate(id.as_str())?;
+        let dir = self.entry_dir(id);
         if !dir.exists() {
-            trace!("filesystem node_id_in_use end: in_use=false");
+            trace!("filesystem entry_id_in_use end: in_use=false");
             return Ok(false);
         }
         let mut has_file = false;
@@ -524,28 +526,8 @@ where
                 break;
             }
         }
-        trace!("filesystem node_id_in_use end: in_use={has_file}");
+        trace!("filesystem entry_id_in_use end: in_use={has_file}");
         Ok(has_file)
-    }
-
-    fn check_edges(
-        &self, at: Eterator, source: &Self::NodeId, targets: &BTreeSet<Self::NodeId>,
-    ) -> Result<Vec<Warning<Self::NodeId>>, Self::Error> {
-        trace!(
-            "filesystem check_edges begin: at={} source={} targets={}",
-            at.version(),
-            source,
-            targets.len()
-        );
-        let mut warnings = Vec::new();
-        for target in targets {
-            if !self.node_exists(at, target)? {
-                warnings
-                    .push(Warning::DanglingEdge { source: source.clone(), target: target.clone() });
-            }
-        }
-        trace!("filesystem check_edges end: warnings={}", warnings.len());
-        Ok(warnings)
     }
 
     fn write(&mut self) -> Self::WriteTxn<'_> {
@@ -583,8 +565,8 @@ where
             | GcOption::UseLiveSet(live) => live,
         };
 
-        for node in self.scan_node_ids()? {
-            let versions = self.list_node_versions(&node)?;
+        for entry in self.scan_entry_ids()? {
+            let versions = self.list_entry_versions(&entry)?;
             let mut delete_paths = Vec::new();
             for (idx, (version, path)) in versions.iter().enumerate() {
                 let next = versions.get(idx + 1).map(|(v, _)| *v).unwrap_or(Eterator(u64::MAX));
@@ -625,16 +607,13 @@ where
 /// Users can chain [`FilesystemFieldRegistry::with_field`] to add additional
 /// compile-time field types before opening the backend.
 ///
-/// Built-in keys are:
+/// Built-in key:
 /// - `lifecycle` for [`Lifecycle<L>`]
-/// - `edges` for [`Edges<FilesystemNodeId>`]
 pub fn builtins_registry<L>() -> FilesystemFieldRegistry
 where
     L: Clone + Debug + Serialize + DeserializeOwned + 'static,
 {
-    FilesystemFieldRegistry::new()
-        .with_field::<Lifecycle<L>>("lifecycle")
-        .with_field::<Edges<FilesystemNodeId>>("edges")
+    FilesystemFieldRegistry::new().with_field::<Lifecycle<L>>("lifecycle")
 }
 
 #[cfg(test)]
@@ -667,56 +646,56 @@ mod tests {
         FilesystemBackend::<State>::open(path, registry).unwrap()
     }
 
-    fn node(s: &str) -> FilesystemNodeId {
-        FilesystemNodeId::new(s).unwrap()
+    fn entry(s: &str) -> FilesystemEntryId {
+        FilesystemEntryId::new(s).unwrap()
     }
 
-    // -- FilesystemNodeId --
+    // -- FilesystemEntryId --
 
     #[test]
-    fn node_id_valid() {
-        assert!(FilesystemNodeId::new("hello").is_ok());
-        assert!(FilesystemNodeId::new("a-b_c.d").is_ok());
-        assert!(FilesystemNodeId::new("a".repeat(255)).is_ok());
-    }
-
-    #[test]
-    fn node_id_rejects_empty() {
-        assert!(FilesystemNodeId::new("").is_err());
+    fn entry_id_valid() {
+        assert!(FilesystemEntryId::new("hello").is_ok());
+        assert!(FilesystemEntryId::new("a-b_c.d").is_ok());
+        assert!(FilesystemEntryId::new("a".repeat(255)).is_ok());
     }
 
     #[test]
-    fn node_id_rejects_dot() {
-        assert!(FilesystemNodeId::new(".").is_err());
-        assert!(FilesystemNodeId::new("..").is_err());
+    fn entry_id_rejects_empty() {
+        assert!(FilesystemEntryId::new("").is_err());
     }
 
     #[test]
-    fn node_id_rejects_slash() {
-        assert!(FilesystemNodeId::new("a/b").is_err());
+    fn entry_id_rejects_dot() {
+        assert!(FilesystemEntryId::new(".").is_err());
+        assert!(FilesystemEntryId::new("..").is_err());
     }
 
     #[test]
-    fn node_id_rejects_null_byte() {
-        assert!(FilesystemNodeId::new("a\0b").is_err());
+    fn entry_id_rejects_slash() {
+        assert!(FilesystemEntryId::new("a/b").is_err());
     }
 
     #[test]
-    fn node_id_rejects_too_long() {
-        assert!(FilesystemNodeId::new("a".repeat(256)).is_err());
+    fn entry_id_rejects_null_byte() {
+        assert!(FilesystemEntryId::new("a\0b").is_err());
     }
 
     #[test]
-    fn node_id_display_and_as_str_match() {
-        let id = FilesystemNodeId::new("mynode").unwrap();
-        assert_eq!(id.as_str(), "mynode");
-        assert_eq!(id.to_string(), "mynode");
+    fn entry_id_rejects_too_long() {
+        assert!(FilesystemEntryId::new("a".repeat(256)).is_err());
     }
 
     #[test]
-    fn node_id_try_from_string() {
-        assert!(FilesystemNodeId::try_from("valid".to_owned()).is_ok());
-        assert!(FilesystemNodeId::try_from("".to_owned()).is_err());
+    fn entry_id_display_and_as_str_match() {
+        let id = FilesystemEntryId::new("my-entry").unwrap();
+        assert_eq!(id.as_str(), "my-entry");
+        assert_eq!(id.to_string(), "my-entry");
+    }
+
+    #[test]
+    fn entry_id_try_from_string() {
+        assert!(FilesystemEntryId::try_from("valid".to_owned()).is_ok());
+        assert!(FilesystemEntryId::try_from("".to_owned()).is_err());
     }
 
     // -- FilesystemFieldRegistry --
@@ -725,7 +704,6 @@ mod tests {
     fn registry_key_for_registered_field() {
         let reg = builtins_registry::<State>();
         assert_eq!(reg.key_for::<Lifecycle<State>>(), Some("lifecycle"));
-        assert_eq!(reg.key_for::<Edges<FilesystemNodeId>>(), Some("edges"));
     }
 
     #[test]
@@ -817,7 +795,7 @@ mod tests {
 
     #[test]
     fn parse_versioned_filename_valid() {
-        let id = node("alpha");
+        let id = entry("alpha");
         let v =
             FilesystemBackend::<State>::parse_versioned_filename("000000000000000f-alpha.md", &id)
                 .unwrap();
@@ -825,8 +803,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_versioned_filename_wrong_node_suffix() {
-        let id = node("alpha");
+    fn parse_versioned_filename_wrong_entry_suffix() {
+        let id = entry("alpha");
         assert!(
             FilesystemBackend::<State>::parse_versioned_filename("000000000000000f-beta.md", &id,)
                 .is_err()
@@ -835,7 +813,7 @@ mod tests {
 
     #[test]
     fn parse_versioned_filename_wrong_hex_length() {
-        let id = node("alpha");
+        let id = entry("alpha");
         assert!(
             FilesystemBackend::<State>::parse_versioned_filename("000f-alpha.md", &id,).is_err()
         );
@@ -843,7 +821,7 @@ mod tests {
 
     #[test]
     fn parse_versioned_filename_non_hex_version() {
-        let id = node("alpha");
+        let id = entry("alpha");
         assert!(
             FilesystemBackend::<State>::parse_versioned_filename("zzzzzzzzzzzzzzzz-alpha.md", &id,)
                 .is_err()
@@ -884,7 +862,7 @@ mod tests {
     fn write_and_resolve_single_field() {
         let temp = tempfile::tempdir().unwrap();
         let mut store = open(temp.path());
-        let a = node("a");
+        let a = entry("a");
         let v1 = store
             .write()
             .set::<Lifecycle<State>>(&a, State::Active)
@@ -901,7 +879,7 @@ mod tests {
     fn current_version_advances_on_each_write() {
         let temp = tempfile::tempdir().unwrap();
         let mut store = open(temp.path());
-        let a = node("a");
+        let a = entry("a");
         assert_eq!(store.current_version().unwrap(), Eterator::EMPTY);
         let v1 = store.write().set::<Lifecycle<State>>(&a, State::Active).commit().unwrap();
         let v2 = store.write().set::<TagField>(&a, "x".to_owned()).commit().unwrap();
@@ -914,7 +892,7 @@ mod tests {
     fn resolve_deleted_field_returns_deleted() {
         let temp = tempfile::tempdir().unwrap();
         let mut store = open(temp.path());
-        let a = node("a");
+        let a = entry("a");
         store
             .write()
             .set::<Lifecycle<State>>(&a, State::Active)
@@ -925,22 +903,22 @@ mod tests {
         assert_eq!(store.resolve::<TagField>(v2, &a).unwrap(), Resolution::Deleted);
     }
 
-    // -- node_id_in_use --
+    // -- entry_id_in_use --
 
     #[test]
-    fn node_id_in_use_false_before_any_write() {
+    fn entry_id_in_use_false_before_any_write() {
         let temp = tempfile::tempdir().unwrap();
         let store = open(temp.path());
-        assert!(!store.node_id_in_use(&node("x")).unwrap());
+        assert!(!store.entry_id_in_use(&entry("x")).unwrap());
     }
 
     #[test]
-    fn node_id_in_use_true_after_write() {
+    fn entry_id_in_use_true_after_write() {
         let temp = tempfile::tempdir().unwrap();
         let mut store = open(temp.path());
-        let a = node("a");
+        let a = entry("a");
         store.write().set::<Lifecycle<State>>(&a, State::Active).commit().unwrap();
-        assert!(store.node_id_in_use(&a).unwrap());
+        assert!(store.entry_id_in_use(&a).unwrap());
     }
 
     // -- retire / only_keep / live_versions / retired_versions --
@@ -949,7 +927,7 @@ mod tests {
     fn retire_adds_to_retired_set() {
         let temp = tempfile::tempdir().unwrap();
         let mut store = open(temp.path());
-        let a = node("a");
+        let a = entry("a");
         let v1 = store.write().set::<Lifecycle<State>>(&a, State::Active).commit().unwrap();
         store.retire([v1]).unwrap();
         assert!(store.retired_versions().unwrap().contains(&v1));
@@ -959,7 +937,7 @@ mod tests {
     fn only_keep_retires_all_others() {
         let temp = tempfile::tempdir().unwrap();
         let mut store = open(temp.path());
-        let a = node("a");
+        let a = entry("a");
         let v1 = store.write().set::<Lifecycle<State>>(&a, State::Active).commit().unwrap();
         let v2 = store.write().set::<TagField>(&a, "t".to_owned()).commit().unwrap();
         store.only_keep([v2]).unwrap();
@@ -972,7 +950,7 @@ mod tests {
     fn live_versions_is_complement_of_retired() {
         let temp = tempfile::tempdir().unwrap();
         let mut store = open(temp.path());
-        let a = node("a");
+        let a = entry("a");
         let v1 = store.write().set::<Lifecycle<State>>(&a, State::Active).commit().unwrap();
         let v2 = store.write().set::<TagField>(&a, "t".to_owned()).commit().unwrap();
         store.retire([v1]).unwrap();
@@ -987,7 +965,7 @@ mod tests {
     fn gc_use_retired_set_removes_redundant_rows() {
         let temp = tempfile::tempdir().unwrap();
         let mut store = open(temp.path());
-        let a = node("a");
+        let a = entry("a");
         let v1 = store
             .write()
             .set::<Lifecycle<State>>(&a, State::Active)
@@ -1006,7 +984,7 @@ mod tests {
     fn gc_use_live_set_does_not_alter_live_reads() {
         let temp = tempfile::tempdir().unwrap();
         let mut store = open(temp.path());
-        let a = node("a");
+        let a = entry("a");
         let v1 = store
             .write()
             .set::<Lifecycle<State>>(&a, State::Active)

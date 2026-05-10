@@ -1,7 +1,7 @@
-//! Eter: Immutable Persistent Graph Store Protocol.
+//! Eter: immutable persistent entry store protocol.
 //!
 //! This crate defines the protocol-level traits for Eter, a versioned
-//! graph store with immutable snapshots. Backends implement [`Eter`] to
+//! entry store with immutable snapshots. Backends implement [`Eter`] to
 //! provide concrete storage.
 //!
 //! See `DESIGN.md` for the full design rationale.
@@ -17,7 +17,7 @@ pub mod filesystem;
 #[cfg(feature = "lmdb")]
 pub mod lmdb;
 
-/// Global version number identifying an immutable snapshot of the graph.
+/// Global version number identifying an immutable snapshot of the entry store.
 ///
 /// Each write produces a new `Eterator` strictly larger than any existing
 /// one. The version is derived as the maximum across all field rows in
@@ -46,14 +46,14 @@ impl Eterator {
 ///   ≤ the queried `Eterator` holds a value.
 /// - [`Deleted`](Resolution::Deleted): that row is a deletion marker.
 /// - [`Absent`](Resolution::Absent): no row exists for this
-///   `(NodeId, field)` pair at or before the queried version.
+///   `(EntryId, field)` pair at or before the queried version.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Resolution<T> {
     /// The field holds content at this snapshot.
     Content(T),
     /// The field was explicitly deleted at or before this snapshot.
     Deleted,
-    /// No row has ever been written for this `(NodeId, field)` pair.
+    /// No row has ever been written for this `(EntryId, field)` pair.
     Absent,
 }
 
@@ -146,9 +146,9 @@ pub enum GcOption {
 
 /// Marker trait binding a field identity to its content type.
 ///
-/// Each field in a node schema is a distinct zero-sized type implementing
+/// Each field in an entry schema is a distinct zero-sized type implementing
 /// `Field`. The store maintains a separate logical table per implementor,
-/// keyed by `(NodeId, version)`.
+/// keyed by `(EntryId, version)`.
 ///
 /// # Panics
 ///
@@ -159,10 +159,10 @@ pub trait Field: 'static {
     type Content: Clone + Debug + Serialize + DeserializeOwned + 'static;
 }
 
-/// Built-in field tracking node existence and lifecycle state.
+/// Built-in field tracking entry existence and lifecycle state.
 ///
-/// The protocol checks this field to determine node presence:
-/// [`Resolution::Content`] means the node exists; any other resolution
+/// The protocol checks this field to determine entry presence:
+/// [`Resolution::Content`] means the entry exists; any other resolution
 /// means it does not. The content type `L` is user-defined (e.g. a
 /// two-state active/removed enum, or richer states like archived or
 /// draft). The protocol only inspects presence, not the value.
@@ -175,32 +175,6 @@ where
     type Content = L;
 }
 
-/// Built-in egress-edge field.
-///
-/// Stored as a sorted set of target node identifiers. Follows the same
-/// versioning and resolution rules as any other field.
-pub struct Edges<Id>(std::marker::PhantomData<Id>);
-
-impl<Id: Ord + Clone + Debug + Serialize + DeserializeOwned + 'static> Field for Edges<Id> {
-    type Content = BTreeSet<Id>;
-}
-
-/// Diagnostic surfaced when reading a self-contained node.
-///
-/// Nodes are always renderable regardless of neighbor state. Warnings
-/// report structural issues without preventing a read from completing.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Warning<Id> {
-    /// An edge references a target `NodeId` that does not exist or has
-    /// been deleted at the queried snapshot.
-    DanglingEdge {
-        /// The node holding the edge.
-        source: Id,
-        /// The referenced node that is absent.
-        target: Id,
-    },
-}
-
 /// Write transaction accumulating field updates for a single version.
 ///
 /// All rows produced by one transaction share the same version number.
@@ -210,29 +184,28 @@ pub enum Warning<Id> {
 /// ```ignore
 /// store.write()
 ///     .set::<Lifecycle<S>>(&id, State::Active)
-///     .set::<Edges<Id>>(&id, edges)
 ///     .commit()?;
 /// ```
 pub trait WriteTxn: Sized {
-    /// The node identifier type.
-    type NodeId;
+    /// The entry identifier type.
+    type EntryId;
     /// Error type for the commit operation.
     type Error;
 
-    /// Write a [`FieldRow`] for a field on a node.
+    /// Write a [`FieldRow`] for a field on an entry.
     ///
     /// This is the primitive write operation. [`WriteTxn::set`] and
     /// [`WriteTxn::delete`] are convenience wrappers.
-    fn apply<F: Field>(self, node: &Self::NodeId, row: FieldRow<F::Content>) -> Self;
+    fn apply<F: Field>(self, entry: &Self::EntryId, row: FieldRow<F::Content>) -> Self;
 
-    /// Set a field's content for a node.
-    fn set<F: Field>(self, node: &Self::NodeId, content: F::Content) -> Self {
-        self.apply::<F>(node, FieldRow::Content(content))
+    /// Set a field's content for an entry.
+    fn set<F: Field>(self, entry: &Self::EntryId, content: F::Content) -> Self {
+        self.apply::<F>(entry, FieldRow::Content(content))
     }
 
-    /// Write a deletion marker for a field on a node.
-    fn delete<F: Field>(self, node: &Self::NodeId) -> Self {
-        self.apply::<F>(node, FieldRow::Deleted)
+    /// Write a deletion marker for a field on an entry.
+    fn delete<F: Field>(self, entry: &Self::EntryId) -> Self {
+        self.apply::<F>(entry, FieldRow::Deleted)
     }
 
     /// Commit all accumulated writes, producing a new snapshot.
@@ -246,12 +219,12 @@ pub trait WriteTxn: Sized {
 /// garbage collection).
 ///
 /// The only persistent global state is the set of retired versions.
-/// All other cross-node data (current version, live-node sets,
-/// reverse-edge indices) is derived and cacheable.
+/// All other cross-entry data, such as the current version and live-entry
+/// sets, is derived and cacheable.
 pub trait Eter {
-    /// Node identifier type, chosen by the user.
+    /// Entry identifier type, chosen by the user.
     /// Must be unique within the store.
-    type NodeId: Eq + Hash + Clone + Ord + Debug;
+    type EntryId: Eq + Hash + Clone + Ord + Debug;
 
     /// User-defined lifecycle state stored in the [`Lifecycle`] field.
     type Lifecycle: Clone + Debug + Serialize + DeserializeOwned + 'static;
@@ -260,55 +233,46 @@ pub trait Eter {
     type Error;
 
     /// The write transaction type returned by [`Eter::write`].
-    type WriteTxn<'a>: WriteTxn<NodeId = Self::NodeId, Error = Self::Error>
+    type WriteTxn<'a>: WriteTxn<EntryId = Self::EntryId, Error = Self::Error>
     where
         Self: 'a;
 
     // -- Reads --
 
-    /// Resolve a field for a node at a given snapshot.
+    /// Resolve a field for an entry at a given snapshot.
     ///
     /// Returns the row with the largest version ≤ `at` in the field's
-    /// logical table for the given node.
+    /// logical table for the given entry.
     fn resolve<F: Field>(
-        &self, at: Eterator, node: &Self::NodeId,
+        &self, at: Eterator, entry: &Self::EntryId,
     ) -> Result<Resolution<F::Content>, Self::Error>;
 
-    /// Check whether a node exists at a given snapshot.
+    /// Check whether an entry exists at a given snapshot.
     ///
     /// Equivalent to checking whether the [`Lifecycle`] field resolves
     /// to [`Resolution::Content`] at `at`.
-    fn node_exists(&self, at: Eterator, node: &Self::NodeId) -> Result<bool, Self::Error>;
+    fn entry_exists(&self, at: Eterator, entry: &Self::EntryId) -> Result<bool, Self::Error>;
 
     /// The current version, derived as the maximum version across all
     /// field rows. Returns [`Eterator::EMPTY`] for an empty store.
     /// May be served from cache.
     fn current_version(&self) -> Result<Eterator, Self::Error>;
 
-    /// All rows ever written for a field on a node, in version order.
+    /// All rows ever written for a field on an entry, in version order.
     ///
     /// Returns `(Eterator, FieldRow)` pairs spanning the full history
-    /// of this `(NodeId, field)`. Useful for auditing, diffing, and
+    /// of this `(EntryId, field)`. Useful for auditing, diffing, and
     /// building undo interfaces.
     fn field_history<F: Field>(
-        &self, node: &Self::NodeId,
+        &self, entry: &Self::EntryId,
     ) -> Result<Vec<VersionedRow<F::Content>>, Self::Error>;
 
-    /// Check whether a `NodeId` has ever been used in the store.
+    /// Check whether an `EntryId` has ever been used in the store.
     ///
     /// Returns `true` if any field row exists for this id at any
-    /// version, including nodes that have since been deleted. Use this
-    /// to verify uniqueness before inserting a new node.
-    fn node_id_in_use(&self, id: &Self::NodeId) -> Result<bool, Self::Error>;
-
-    /// Check an edge set for dangling references at a given snapshot.
-    ///
-    /// Returns a [`Warning`] for each target in `targets` that does not
-    /// exist at `at`. The edge set is unmodified; the source node
-    /// remains fully renderable.
-    fn check_edges(
-        &self, at: Eterator, source: &Self::NodeId, targets: &BTreeSet<Self::NodeId>,
-    ) -> Result<Vec<Warning<Self::NodeId>>, Self::Error>;
+    /// version, including entries that have since been deleted. Use this
+    /// to verify uniqueness before inserting a new entry.
+    fn entry_id_in_use(&self, id: &Self::EntryId) -> Result<bool, Self::Error>;
 
     // -- Writes --
 
@@ -358,6 +322,15 @@ pub trait Eter {
     /// stable. Useful for deciding which versions to pass to
     /// [`Eter::only_keep`] or [`Eter::retire`].
     fn live_versions(&self) -> Result<BTreeSet<Eterator>, Self::Error>;
+}
+
+/// Optional trait for backends that cache the live-entry set.
+///
+/// Without this, enumerating live entries requires scanning the full
+/// [`Eter::EntryId`] space and checking each entry's [`Lifecycle`] field.
+pub trait LiveEntries: Eter {
+    /// All entry identifiers whose [`Lifecycle`] field resolves to content at `at`.
+    fn live_entries(&self, at: Eterator) -> Result<BTreeSet<Self::EntryId>, Self::Error>;
 }
 
 #[cfg(test)]
@@ -457,26 +430,4 @@ mod tests {
         let r: Resolution<u32> = FieldRow::<u32>::Deleted.into();
         assert_eq!(r, Resolution::Deleted);
     }
-}
-
-// -- Optional cache traits --
-
-/// Optional trait for backends that cache the live-node set.
-///
-/// Without this, enumerating live nodes requires scanning the full
-/// `NodeId` space and checking each node's `lifecycle` field.
-pub trait LiveNodes: Eter {
-    /// All `NodeId`s whose [`Lifecycle`] field resolves to content at `at`.
-    fn live_nodes(&self, at: Eterator) -> Result<BTreeSet<Self::NodeId>, Self::Error>;
-}
-
-/// Optional trait for backends that maintain a reverse-edge index.
-///
-/// Without this, ingress-edge queries require a full scan of all nodes'
-/// edge fields.
-pub trait ReverseEdges: Eter {
-    /// All `NodeId`s that have an egress edge pointing to `target` at `at`.
-    fn ingress_edges(
-        &self, at: Eterator, target: &Self::NodeId,
-    ) -> Result<BTreeSet<Self::NodeId>, Self::Error>;
 }

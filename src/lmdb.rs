@@ -9,9 +9,9 @@
 //! - `_retired`: the persistent retired-version set. Survives process restarts,
 //!   unlike the filesystem backend's in-memory retired set.
 //!
-//! Key encoding per field database: `NodeId.to_key_bytes() ++ version.to_be_bytes()`.
-//! The node portion is exactly [`LmdbKey::KEY_LEN`] bytes; the version portion
-//! is always 8 bytes. Fixed-length node IDs eliminate any composite-key ambiguity.
+//! Key encoding per field database: `EntryId.to_key_bytes() ++ version.to_be_bytes()`.
+//! The entry portion is exactly [`LmdbKey::KEY_LEN`] bytes; the version portion
+//! is always 8 bytes. Fixed-length entry IDs eliminate any composite-key ambiguity.
 //!
 //! Value encoding: `[0x00]` is a [`FieldRow::Deleted`] marker; `[0x01, ...json]`
 //! is [`FieldRow::Content`] with JSON-serialized content.
@@ -30,15 +30,14 @@ use thiserror::Error;
 use tracing::trace;
 
 use crate::{
-    Edges, Eter, Eterator, Field, FieldRow, GcOption, Lifecycle, Resolution, VersionedRow, Warning,
-    WriteTxn,
+    Eter, Eterator, Field, FieldRow, GcOption, Lifecycle, Resolution, VersionedRow, WriteTxn,
 };
 
 // ---------------------------------------------------------------------------
 // LmdbKey trait
 // ---------------------------------------------------------------------------
 
-/// Required for node identifier types stored in the LMDB backend.
+/// Required for entry identifier types stored in the LMDB backend.
 ///
 /// The encoding must be:
 /// - **Fixed-length**: every value produces exactly [`LmdbKey::KEY_LEN`] bytes.
@@ -50,7 +49,7 @@ use crate::{
 pub trait LmdbKey:
     Eq + Hash + Clone + Ord + Debug + Serialize + DeserializeOwned + Send + Sync + 'static
 {
-    /// Exact byte length of the encoded node identifier.
+    /// Exact byte length of the encoded entry identifier.
     const KEY_LEN: usize;
 
     /// Encode to exactly `KEY_LEN` bytes.
@@ -64,17 +63,17 @@ pub trait LmdbKey:
 // Encoding helpers
 // ---------------------------------------------------------------------------
 
-fn node_prefix<Id: LmdbKey>(node: &Id) -> Vec<u8> {
-    let prefix = node.to_key_bytes();
+fn entry_prefix<Id: LmdbKey>(entry: &Id) -> Vec<u8> {
+    let prefix = entry.to_key_bytes();
     debug_assert_eq!(prefix.len(), Id::KEY_LEN, "LmdbKey::to_key_bytes returned wrong length");
     prefix
 }
 
 fn split_composite_key<Id: LmdbKey>(key: &[u8]) -> (Id, Eterator) {
-    let node = Id::from_key_bytes(&key[..Id::KEY_LEN]);
+    let entry = Id::from_key_bytes(&key[..Id::KEY_LEN]);
     let version =
         u64::from_be_bytes(key[Id::KEY_LEN..Id::KEY_LEN + 8].try_into().expect("key too short"));
-    (node, Eterator(version))
+    (entry, Eterator(version))
 }
 
 fn encode_version_key(v: Eterator) -> [u8; 8] {
@@ -282,24 +281,6 @@ where
     /// The transaction must be closed promptly. Holding it open pins LMDB's
     /// freelist and occupies a reader-table slot; see the design notes in
     /// DESIGN.md under "Eterators and Read Transactions."
-    /// Open a read-only transaction on the underlying LMDB environment.
-    ///
-    /// Use this together with [`LmdbBackend::resolve_in`] when strict
-    /// multi-field snapshot consistency is required: all `resolve_in` calls
-    /// within one transaction observe the same committed state.
-    ///
-    /// The transaction must be closed promptly. Holding it open pins LMDB's
-    /// freelist and occupies a reader-table slot; see the design notes in
-    /// DESIGN.md under "Eterators and Read Transactions."
-    /// Open a read-only transaction on the underlying LMDB environment.
-    ///
-    /// Use this together with [`LmdbBackend::resolve_in`] when strict
-    /// multi-field snapshot consistency is required: all `resolve_in` calls
-    /// within one transaction observe the same committed state.
-    ///
-    /// The transaction must be closed promptly. Holding it open pins LMDB's
-    /// freelist and occupies a reader-table slot; see the design notes in
-    /// DESIGN.md under "Eterators and Read Transactions."
     ///
     /// Returns `RoTxn<'_, WithTls>`. To pass it to `resolve_in`, which takes
     /// `&RoTxn` (= `RoTxn<AnyTls>`), Rust applies deref-coercion automatically.
@@ -307,7 +288,7 @@ where
         Ok(self.env.read_txn()?)
     }
 
-    /// Resolve field `F` for `node` at `at` using a caller-supplied read transaction.
+    /// Resolve field `F` for `entry` at `at` using a caller-supplied read transaction.
     ///
     /// The transaction is not closed; the caller controls its lifetime.
     /// All `resolve_in` calls sharing one transaction observe a consistent
@@ -321,27 +302,27 @@ where
     ///
     /// # Complexity
     ///
-    /// Iterates the node's rows in descending version order via
+    /// Iterates the entry's rows in descending version order via
     /// `rev_prefix_iter`, stopping at the first version ≤ `at`.  This is O(1)
     /// when `at` equals the current version (the common case) and O(k) in the
     /// worst case, where k is the number of versions newer than `at` for this
-    /// `(node, field)` pair.
+    /// `(entry, field)` pair.
     ///
     /// Note: the ideal O(log n) algorithm described in DESIGN.md would use a
-    /// lower-bound cursor seek to `(N, V)` and step back once.  The `heed`
+    /// lower-bound cursor seek to `(entry, V)` and step back once.  The `heed`
     /// 0.22 `Bytes` codec does not expose range bounds in a form that permits
     /// this directly, so `rev_prefix_iter` is used instead.  The two
     /// approaches are equivalent for the common case; the O(log n) version is
     /// worth revisiting if a clean range API becomes available.
     pub fn resolve_in<F: Field>(
-        &self, rtxn: &RoTxn<'_>, node: &Id, at: Eterator,
+        &self, rtxn: &RoTxn<'_>, entry: &Id, at: Eterator,
     ) -> Result<Resolution<F::Content>, LmdbError> {
         let db = self.field_db_or_panic::<F>();
-        let prefix = node_prefix::<Id>(node);
+        let prefix = entry_prefix::<Id>(entry);
 
         for result in db.rev_prefix_iter(rtxn, &prefix)? {
             let (key, value) = result?;
-            let (_node, version) = split_composite_key::<Id>(key);
+            let (_entry, version) = split_composite_key::<Id>(key);
             if version <= at {
                 return Ok(decode_field_row::<F::Content>(value)?.into());
             }
@@ -349,9 +330,7 @@ where
         Ok(Resolution::Absent)
     }
 
-    fn all_store_versions_in(
-        &self, rtxn: &RoTxn<'_>,
-    ) -> Result<BTreeSet<Eterator>, LmdbError> {
+    fn all_store_versions_in(&self, rtxn: &RoTxn<'_>) -> Result<BTreeSet<Eterator>, LmdbError> {
         let mut versions = BTreeSet::new();
         for result in self.versions_db.iter(rtxn)? {
             let (key, _) = result?;
@@ -360,9 +339,7 @@ where
         Ok(versions)
     }
 
-    fn all_retired_versions_in(
-        &self, rtxn: &RoTxn<'_>,
-    ) -> Result<BTreeSet<Eterator>, LmdbError> {
+    fn all_retired_versions_in(&self, rtxn: &RoTxn<'_>) -> Result<BTreeSet<Eterator>, LmdbError> {
         let mut retired = BTreeSet::new();
         for result in self.retired_db.iter(rtxn)? {
             let (key, _) = result?;
@@ -373,7 +350,7 @@ where
 
     /// Collect all composite keys in `db` whose rows are collectible given `live`.
     ///
-    /// Keys are grouped by node prefix (they are already sorted, so same-node
+    /// Keys are grouped by entry prefix (they are already sorted, so same-entry
     /// keys are contiguous). Within each group, a row at version `v` with next
     /// row at `next_v` is collectible iff no live version falls in `[v, next_v)`.
     fn collect_gc_keys(
@@ -435,7 +412,7 @@ fn scan_last_version(
 // ---------------------------------------------------------------------------
 
 /// Pending writes for a single transaction: field [`TypeId`] → list of
-/// `(node_bytes, encoded_row)` pairs.  The version bytes are not yet appended;
+/// `(entry_bytes, encoded_row)` pairs.  The version bytes are not yet appended;
 /// they are added at commit time once the next version number is known.
 type PendingWrites = HashMap<TypeId, Vec<(Vec<u8>, Vec<u8>)>>;
 
@@ -464,15 +441,15 @@ where
     Id: LmdbKey,
     L: Clone + Debug + Serialize + DeserializeOwned + 'static,
 {
-    type NodeId = Id;
+    type EntryId = Id;
     type Error = LmdbError;
 
-    fn apply<F: Field>(mut self, node: &Self::NodeId, row: FieldRow<F::Content>) -> Self {
+    fn apply<F: Field>(mut self, entry: &Self::EntryId, row: FieldRow<F::Content>) -> Self {
         // Panics here rather than at commit time, matching filesystem backend behaviour.
         let _db = self.store.field_db_or_panic::<F>();
-        let node_bytes = node_prefix::<Id>(node);
+        let entry_bytes = entry_prefix::<Id>(entry);
         let encoded = encode_field_row::<F::Content>(&row);
-        self.pending.entry(TypeId::of::<F>()).or_default().push((node_bytes, encoded));
+        self.pending.entry(TypeId::of::<F>()).or_default().push((entry_bytes, encoded));
         self
     }
 
@@ -494,9 +471,9 @@ where
                 .field_dbs
                 .get(&tid)
                 .expect("field type not registered (checked in apply)");
-            for (mut node_bytes, encoded) in writes {
-                node_bytes.extend_from_slice(&version_be);
-                db.put(&mut wtxn, &node_bytes, &encoded)?;
+            for (mut entry_bytes, encoded) in writes {
+                entry_bytes.extend_from_slice(&version_be);
+                db.put(&mut wtxn, &entry_bytes, &encoded)?;
             }
         }
 
@@ -518,7 +495,7 @@ where
     Id: LmdbKey,
     L: Clone + Debug + Serialize + DeserializeOwned + 'static,
 {
-    type NodeId = Id;
+    type EntryId = Id;
     type Lifecycle = L;
     type Error = LmdbError;
     type WriteTxn<'a>
@@ -527,17 +504,17 @@ where
         Self: 'a;
 
     fn resolve<F: Field>(
-        &self, at: Eterator, node: &Self::NodeId,
+        &self, at: Eterator, entry: &Self::EntryId,
     ) -> Result<Resolution<F::Content>, Self::Error> {
-        trace!("lmdb resolve begin: at={} node={node:?}", at.version());
+        trace!("lmdb resolve begin: at={} entry={entry:?}", at.version());
         let rtxn = self.env.read_txn()?;
-        let result = self.resolve_in::<F>(&rtxn, node, at)?;
+        let result = self.resolve_in::<F>(&rtxn, entry, at)?;
         trace!("lmdb resolve end");
         Ok(result)
     }
 
-    fn node_exists(&self, at: Eterator, node: &Self::NodeId) -> Result<bool, Self::Error> {
-        Ok(self.resolve::<Lifecycle<L>>(at, node)?.is_content())
+    fn entry_exists(&self, at: Eterator, entry: &Self::EntryId) -> Result<bool, Self::Error> {
+        Ok(self.resolve::<Lifecycle<L>>(at, entry)?.is_content())
     }
 
     fn current_version(&self) -> Result<Eterator, Self::Error> {
@@ -545,16 +522,16 @@ where
     }
 
     fn field_history<F: Field>(
-        &self, node: &Self::NodeId,
+        &self, entry: &Self::EntryId,
     ) -> Result<Vec<VersionedRow<F::Content>>, Self::Error> {
-        trace!("lmdb field_history begin: node={node:?}");
+        trace!("lmdb field_history begin: entry={entry:?}");
         let db = self.field_db_or_panic::<F>();
-        let prefix = node_prefix::<Id>(node);
+        let prefix = entry_prefix::<Id>(entry);
         let rtxn = self.env.read_txn()?;
         let mut out = Vec::new();
         for result in db.prefix_iter(&rtxn, &prefix)? {
             let (key, value) = result?;
-            let (_node, version) = split_composite_key::<Id>(key);
+            let (_entry, version) = split_composite_key::<Id>(key);
             let row = decode_field_row::<F::Content>(value)?;
             out.push((version, row));
         }
@@ -562,9 +539,9 @@ where
         Ok(out)
     }
 
-    fn node_id_in_use(&self, id: &Self::NodeId) -> Result<bool, Self::Error> {
-        trace!("lmdb node_id_in_use begin: id={id:?}");
-        let prefix = node_prefix::<Id>(id);
+    fn entry_id_in_use(&self, id: &Self::EntryId) -> Result<bool, Self::Error> {
+        trace!("lmdb entry_id_in_use begin: id={id:?}");
+        let prefix = entry_prefix::<Id>(id);
         let rtxn = self.env.read_txn()?;
         // Check every field db: any row for this prefix means the id has been used.
         // The lifecycle db is first in the iteration by accident of insertion order,
@@ -572,31 +549,12 @@ where
         // a non-lifecycle field without a corresponding lifecycle row.
         for &db in self.field_dbs.values() {
             if db.prefix_iter(&rtxn, &prefix)?.next().is_some() {
-                trace!("lmdb node_id_in_use end: in_use=true");
+                trace!("lmdb entry_id_in_use end: in_use=true");
                 return Ok(true);
             }
         }
-        trace!("lmdb node_id_in_use end: in_use=false");
+        trace!("lmdb entry_id_in_use end: in_use=false");
         Ok(false)
-    }
-
-    fn check_edges(
-        &self, at: Eterator, source: &Self::NodeId, targets: &BTreeSet<Self::NodeId>,
-    ) -> Result<Vec<Warning<Self::NodeId>>, Self::Error> {
-        trace!(
-            "lmdb check_edges begin: at={} source={source:?} targets={}",
-            at.version(),
-            targets.len()
-        );
-        let mut warnings = Vec::new();
-        for target in targets {
-            if !self.node_exists(at, target)? {
-                warnings
-                    .push(Warning::DanglingEdge { source: source.clone(), target: target.clone() });
-            }
-        }
-        trace!("lmdb check_edges end: warnings={}", warnings.len());
-        Ok(warnings)
     }
 
     fn write(&mut self) -> Self::WriteTxn<'_> {
@@ -726,30 +684,30 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// LiveNodes optional trait
+// LiveEntries optional trait
 // ---------------------------------------------------------------------------
 
-impl<Id, L> crate::LiveNodes for LmdbBackend<Id, L>
+impl<Id, L> crate::LiveEntries for LmdbBackend<Id, L>
 where
     Id: LmdbKey,
     L: Clone + Debug + Serialize + DeserializeOwned + 'static,
 {
-    /// Returns all node IDs whose [`Lifecycle`] field resolves to content at `at`.
+    /// Returns all entry IDs whose [`Lifecycle`] field resolves to content at `at`.
     ///
     /// Scans the entire lifecycle database in ascending key order — O(total
-    /// lifecycle rows).  For each node, rows are visited in ascending version
+    /// lifecycle rows).  For each entry, rows are visited in ascending version
     /// order; the set membership is updated on every row ≤ `at` so that the
-    /// final state for each node reflects the most-recent row at or before `at`.
-    /// Once a row with version > `at` is seen for a node, that node's group is
+    /// final state for each entry reflects the most-recent row at or before `at`.
+    /// Once a row with version > `at` is seen for an entry, that entry's group is
     /// marked done and its remaining rows are skipped.
-    fn live_nodes(&self, at: Eterator) -> Result<BTreeSet<Id>, Self::Error> {
-        trace!("lmdb live_nodes begin: at={}", at.version());
+    fn live_entries(&self, at: Eterator) -> Result<BTreeSet<Id>, Self::Error> {
+        trace!("lmdb live_entries begin: at={}", at.version());
         let lifecycle_db = self.field_db_or_panic::<Lifecycle<L>>();
         let rtxn = self.env.read_txn()?;
         let mut live = BTreeSet::new();
 
         let mut current_prefix: Vec<u8> = Vec::new();
-        let mut current_node_done = false;
+        let mut current_entry_done = false;
 
         for result in lifecycle_db.iter(&rtxn)? {
             let (key, value) = result?;
@@ -758,28 +716,28 @@ where
 
             if prefix != current_prefix {
                 current_prefix = prefix;
-                current_node_done = false;
+                current_entry_done = false;
             }
-            if current_node_done {
+            if current_entry_done {
                 continue;
             }
             if version <= at {
                 let row = decode_field_row::<L>(value)?;
-                let node = Id::from_key_bytes(&key[..Id::KEY_LEN]);
+                let entry = Id::from_key_bytes(&key[..Id::KEY_LEN]);
                 match row {
                     | FieldRow::Content(_) => {
-                        live.insert(node);
+                        live.insert(entry);
                     }
                     | FieldRow::Deleted => {
-                        live.remove(&node);
+                        live.remove(&entry);
                     }
                 }
             } else {
-                current_node_done = true;
+                current_entry_done = true;
             }
         }
 
-        trace!("lmdb live_nodes end: count={}", live.len());
+        trace!("lmdb live_entries end: count={}", live.len());
         Ok(live)
     }
 }
@@ -791,9 +749,8 @@ where
 /// Convenience constructor for a [`LmdbFieldConfig`] with the built-in
 /// protocol fields pre-registered.
 ///
-/// Built-in database names:
+/// Built-in database name:
 /// - `"lifecycle"` for [`Lifecycle<L>`]
-/// - `"edges"` for [`Edges<Id>`]
 ///
 /// Chain [`LmdbFieldConfig::with_field`] to add user-defined fields.
 pub fn lmdb_builtins_config<Id, L>() -> LmdbFieldConfig
@@ -801,7 +758,7 @@ where
     Id: LmdbKey,
     L: Clone + Debug + Serialize + DeserializeOwned + 'static,
 {
-    LmdbFieldConfig::new().with_field::<Lifecycle<L>>("lifecycle").with_field::<Edges<Id>>("edges")
+    LmdbFieldConfig::new().with_field::<Lifecycle<L>>("lifecycle")
 }
 
 // ---------------------------------------------------------------------------
@@ -815,7 +772,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use tempfile::TempDir;
 
-    // --- Test NodeId: fixed 8-byte big-endian integer ---
+    // --- Test EntryId: fixed 8-byte big-endian integer ---
 
     #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
     struct TestId(u64);
@@ -945,25 +902,25 @@ mod tests {
         assert_eq!(v1, v_noop);
     }
 
-    // --- node_exists / node_id_in_use ---
+    // --- entry_exists / entry_id_in_use ---
 
     #[test]
-    fn node_exists_reflects_lifecycle() {
+    fn entry_exists_reflects_lifecycle() {
         let dir = TempDir::new().unwrap();
         let mut store = open(&dir);
         let v1 = store.write().set::<Lifecycle<State>>(&id(1), State::Active).commit().unwrap();
         let v2 = store.write().delete::<Lifecycle<State>>(&id(1)).commit().unwrap();
-        assert!(store.node_exists(v1, &id(1)).unwrap());
-        assert!(!store.node_exists(v2, &id(1)).unwrap());
+        assert!(store.entry_exists(v1, &id(1)).unwrap());
+        assert!(!store.entry_exists(v2, &id(1)).unwrap());
     }
 
     #[test]
-    fn node_id_in_use_after_write() {
+    fn entry_id_in_use_after_write() {
         let dir = TempDir::new().unwrap();
         let mut store = open(&dir);
-        assert!(!store.node_id_in_use(&id(42)).unwrap());
+        assert!(!store.entry_id_in_use(&id(42)).unwrap());
         store.write().set::<Lifecycle<State>>(&id(42), State::Active).commit().unwrap();
-        assert!(store.node_id_in_use(&id(42)).unwrap());
+        assert!(store.entry_id_in_use(&id(42)).unwrap());
     }
 
     // --- field_history ---
@@ -1088,43 +1045,5 @@ mod tests {
 
         assert_eq!(store.resolve::<CountField>(v1, &id(1)).unwrap(), Resolution::Content(1));
         assert_eq!(store.resolve::<CountField>(v2, &id(1)).unwrap(), Resolution::Content(2));
-    }
-
-    // --- check_edges / dangling ---
-
-    #[test]
-    fn check_edges_reports_dangling() {
-        use crate::Edges;
-        let dir = TempDir::new().unwrap();
-        let mut store = open(&dir);
-        let v1 = store
-            .write()
-            .set::<Lifecycle<State>>(&id(1), State::Active)
-            .set::<Edges<TestId>>(&id(1), BTreeSet::from([id(99)]))
-            .commit()
-            .unwrap();
-        let warnings = store.check_edges(v1, &id(1), &BTreeSet::from([id(99)])).unwrap();
-        assert_eq!(warnings.len(), 1);
-        assert!(matches!(
-            &warnings[0],
-            crate::Warning::DanglingEdge { source, target }
-            if *source == id(1) && *target == id(99)
-        ));
-    }
-
-    #[test]
-    fn check_edges_no_warnings_for_live_target() {
-        use crate::Edges;
-        let dir = TempDir::new().unwrap();
-        let mut store = open(&dir);
-        let v1 = store
-            .write()
-            .set::<Lifecycle<State>>(&id(1), State::Active)
-            .set::<Lifecycle<State>>(&id(2), State::Active)
-            .set::<Edges<TestId>>(&id(1), BTreeSet::from([id(2)]))
-            .commit()
-            .unwrap();
-        let warnings = store.check_edges(v1, &id(1), &BTreeSet::from([id(2)])).unwrap();
-        assert!(warnings.is_empty());
     }
 }

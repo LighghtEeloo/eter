@@ -1,9 +1,7 @@
 use std::collections::BTreeSet;
 
-use eter::filesystem::{FilesystemBackend, FilesystemNodeId, builtins_registry};
-use eter::{
-    Edges, Eter, Eterator, Field, FieldRow, GcOption, Lifecycle, Resolution, Warning, WriteTxn,
-};
+use eter::filesystem::{FilesystemBackend, FilesystemEntryId, builtins_registry};
+use eter::{Eter, Eterator, Field, FieldRow, GcOption, Lifecycle, Resolution, WriteTxn};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,16 +42,14 @@ fn filesystem_backend_supports_static_user_defined_fields() -> Result<(), Box<dy
 
     let mut store = FilesystemBackend::<LifeState>::open(temp.path(), registry)?;
 
-    let alpha = FilesystemNodeId::new("alpha")?;
-    let beta = FilesystemNodeId::new("beta")?;
+    let alpha = FilesystemEntryId::new("alpha")?;
+    let beta = FilesystemEntryId::new("beta")?;
 
-    let alpha_edges = BTreeSet::from([beta.clone()]);
     let aliases_v1 = BTreeSet::from(["a".to_owned(), "alpha".to_owned()]);
 
     let v1 = store
         .write()
         .set::<Lifecycle<LifeState>>(&alpha, LifeState::Active)
-        .set::<Edges<FilesystemNodeId>>(&alpha, alpha_edges)
         .set::<TitleField>(&alpha, "Alpha".to_owned())
         .set::<PriorityField>(&alpha, 1)
         .set::<AliasesField>(&alpha, aliases_v1.clone())
@@ -86,7 +82,7 @@ fn filesystem_backend_supports_static_user_defined_fields() -> Result<(), Box<dy
 
     store.gc(GcOption::UseLiveSet(BTreeSet::from([v3])))?;
     assert_eq!(store.field_history::<PriorityField>(&alpha)?, vec![(v3, FieldRow::Content(2))]);
-    assert!(store.node_exists(v3, &beta)?);
+    assert!(store.entry_exists(v3, &beta)?);
     assert_eq!(store.resolve::<TitleField>(v3, &beta)?, Resolution::Content("Beta".to_owned()));
 
     Ok(())
@@ -119,7 +115,7 @@ fn empty_transaction_is_noop_and_returns_current_version() -> Result<(), Box<dyn
 {
     let temp = tempfile::tempdir()?;
     let mut store = open_store(temp.path())?;
-    let alpha = FilesystemNodeId::new("alpha")?;
+    let alpha = FilesystemEntryId::new("alpha")?;
     let v1 = store.write().set::<Lifecycle<LifeState>>(&alpha, LifeState::Active).commit()?;
 
     // Empty transaction: no pending mutations.
@@ -129,12 +125,12 @@ fn empty_transaction_is_noop_and_returns_current_version() -> Result<(), Box<dyn
 }
 
 #[test]
-fn multi_node_single_transaction_shares_version() -> Result<(), Box<dyn std::error::Error>> {
+fn multi_entry_single_transaction_shares_version() -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempfile::tempdir()?;
     let mut store = open_store(temp.path())?;
 
-    let alpha = FilesystemNodeId::new("alpha")?;
-    let beta = FilesystemNodeId::new("beta")?;
+    let alpha = FilesystemEntryId::new("alpha")?;
+    let beta = FilesystemEntryId::new("beta")?;
 
     let v1 = store
         .write()
@@ -144,11 +140,11 @@ fn multi_node_single_transaction_shares_version() -> Result<(), Box<dyn std::err
         .set::<TitleField>(&beta, "Beta".to_owned())
         .commit()?;
 
-    // Both nodes exist at exactly v1.
-    assert!(store.node_exists(v1, &alpha)?);
-    assert!(store.node_exists(v1, &beta)?);
+    // Both entries exist at exactly v1.
+    assert!(store.entry_exists(v1, &alpha)?);
+    assert!(store.entry_exists(v1, &beta)?);
 
-    // Both nodes appear at the same version in their history.
+    // Both entries appear at the same version in their history.
     let alpha_hist = store.field_history::<TitleField>(&alpha)?;
     let beta_hist = store.field_history::<TitleField>(&beta)?;
     assert_eq!(alpha_hist.len(), 1);
@@ -163,7 +159,7 @@ fn resolution_absent_for_never_written_field() -> Result<(), Box<dyn std::error:
     let temp = tempfile::tempdir()?;
     let mut store = open_store(temp.path())?;
 
-    let alpha = FilesystemNodeId::new("alpha")?;
+    let alpha = FilesystemEntryId::new("alpha")?;
     let v1 = store.write().set::<Lifecycle<LifeState>>(&alpha, LifeState::Active).commit()?;
 
     // PriorityField was never written for alpha.
@@ -172,16 +168,16 @@ fn resolution_absent_for_never_written_field() -> Result<(), Box<dyn std::error:
 }
 
 #[test]
-fn resolution_absent_for_unknown_node() -> Result<(), Box<dyn std::error::Error>> {
+fn resolution_absent_for_unknown_entry() -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempfile::tempdir()?;
     let mut store = open_store(temp.path())?;
 
-    let alpha = FilesystemNodeId::new("alpha")?;
+    let alpha = FilesystemEntryId::new("alpha")?;
     let v1 = store.write().set::<Lifecycle<LifeState>>(&alpha, LifeState::Active).commit()?;
 
-    let ghost = FilesystemNodeId::new("ghost")?;
+    let ghost = FilesystemEntryId::new("ghost")?;
     assert_eq!(store.resolve::<TitleField>(v1, &ghost)?, Resolution::Absent);
-    assert!(!store.node_exists(v1, &ghost)?);
+    assert!(!store.entry_exists(v1, &ghost)?);
     Ok(())
 }
 
@@ -190,7 +186,7 @@ fn historical_snapshot_read_returns_old_value() -> Result<(), Box<dyn std::error
     let temp = tempfile::tempdir()?;
     let mut store = open_store(temp.path())?;
 
-    let alpha = FilesystemNodeId::new("alpha")?;
+    let alpha = FilesystemEntryId::new("alpha")?;
     let v1 = store
         .write()
         .set::<Lifecycle<LifeState>>(&alpha, LifeState::Active)
@@ -207,116 +203,47 @@ fn historical_snapshot_read_returns_old_value() -> Result<(), Box<dyn std::error
 }
 
 #[test]
-fn node_lifecycle_delete_and_recreate() -> Result<(), Box<dyn std::error::Error>> {
+fn entry_lifecycle_delete_and_recreate() -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempfile::tempdir()?;
     let mut store = open_store(temp.path())?;
 
-    let alpha = FilesystemNodeId::new("alpha")?;
+    let alpha = FilesystemEntryId::new("alpha")?;
     let v1 = store
         .write()
         .set::<Lifecycle<LifeState>>(&alpha, LifeState::Active)
         .set::<TitleField>(&alpha, "Original".to_owned())
         .commit()?;
 
-    assert!(store.node_exists(v1, &alpha)?);
+    assert!(store.entry_exists(v1, &alpha)?);
 
-    // Delete the node by writing a deletion marker to lifecycle.
+    // Delete the entry by writing a deletion marker to lifecycle.
     let v2 = store.write().delete::<Lifecycle<LifeState>>(&alpha).commit()?;
-    assert!(!store.node_exists(v2, &alpha)?);
+    assert!(!store.entry_exists(v2, &alpha)?);
 
-    // NodeId remains "in use" even after deletion.
-    assert!(store.node_id_in_use(&alpha)?);
+    // EntryId remains "in use" even after deletion.
+    assert!(store.entry_id_in_use(&alpha)?);
 
-    // Re-create the node at a later version.
+    // Re-create the entry at a later version.
     let v3 = store
         .write()
         .set::<Lifecycle<LifeState>>(&alpha, LifeState::Active)
         .set::<TitleField>(&alpha, "Reborn".to_owned())
         .commit()?;
 
-    assert!(store.node_exists(v3, &alpha)?);
+    assert!(store.entry_exists(v3, &alpha)?);
     assert_eq!(store.resolve::<TitleField>(v3, &alpha)?, Resolution::Content("Reborn".to_owned()));
-    // Historical read: node was absent at v2.
-    assert!(!store.node_exists(v2, &alpha)?);
+    // Historical read: entry was absent at v2.
+    assert!(!store.entry_exists(v2, &alpha)?);
     Ok(())
 }
 
 #[test]
-fn node_id_in_use_returns_false_for_fresh_id() -> Result<(), Box<dyn std::error::Error>> {
+fn entry_id_in_use_returns_false_for_fresh_id() -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempfile::tempdir()?;
     let store = open_store(temp.path())?;
 
-    let ghost = FilesystemNodeId::new("ghost")?;
-    assert!(!store.node_id_in_use(&ghost)?);
-    Ok(())
-}
-
-#[test]
-fn check_edges_reports_dangling_targets() -> Result<(), Box<dyn std::error::Error>> {
-    let temp = tempfile::tempdir()?;
-    let mut store = open_store(temp.path())?;
-
-    let alpha = FilesystemNodeId::new("alpha")?;
-    let ghost = FilesystemNodeId::new("ghost")?;
-
-    let edges = BTreeSet::from([ghost.clone()]);
-    let v1 = store
-        .write()
-        .set::<Lifecycle<LifeState>>(&alpha, LifeState::Active)
-        .set::<Edges<FilesystemNodeId>>(&alpha, edges.clone())
-        .commit()?;
-
-    let warnings = store.check_edges(v1, &alpha, &edges)?;
-    assert_eq!(warnings.len(), 1);
-    assert_eq!(warnings[0], Warning::DanglingEdge { source: alpha.clone(), target: ghost.clone() });
-    Ok(())
-}
-
-#[test]
-fn check_edges_no_warnings_for_existing_targets() -> Result<(), Box<dyn std::error::Error>> {
-    let temp = tempfile::tempdir()?;
-    let mut store = open_store(temp.path())?;
-
-    let alpha = FilesystemNodeId::new("alpha")?;
-    let beta = FilesystemNodeId::new("beta")?;
-
-    let edges = BTreeSet::from([beta.clone()]);
-    let v1 = store
-        .write()
-        .set::<Lifecycle<LifeState>>(&alpha, LifeState::Active)
-        .set::<Lifecycle<LifeState>>(&beta, LifeState::Active)
-        .set::<Edges<FilesystemNodeId>>(&alpha, edges.clone())
-        .commit()?;
-
-    let warnings = store.check_edges(v1, &alpha, &edges)?;
-    assert!(warnings.is_empty());
-    Ok(())
-}
-
-#[test]
-fn check_edges_warns_when_target_deleted_at_snapshot() -> Result<(), Box<dyn std::error::Error>> {
-    let temp = tempfile::tempdir()?;
-    let mut store = open_store(temp.path())?;
-
-    let alpha = FilesystemNodeId::new("alpha")?;
-    let beta = FilesystemNodeId::new("beta")?;
-    let edges = BTreeSet::from([beta.clone()]);
-
-    let v1 = store
-        .write()
-        .set::<Lifecycle<LifeState>>(&alpha, LifeState::Active)
-        .set::<Lifecycle<LifeState>>(&beta, LifeState::Active)
-        .set::<Edges<FilesystemNodeId>>(&alpha, edges.clone())
-        .commit()?;
-
-    // Delete beta.
-    let v2 = store.write().delete::<Lifecycle<LifeState>>(&beta).commit()?;
-
-    // At v1 no warnings; at v2 beta is gone → dangling.
-    assert!(store.check_edges(v1, &alpha, &edges)?.is_empty());
-    let warnings = store.check_edges(v2, &alpha, &edges)?;
-    assert_eq!(warnings.len(), 1);
-    assert!(matches!(&warnings[0], Warning::DanglingEdge { target, .. } if target == &beta));
+    let ghost = FilesystemEntryId::new("ghost")?;
+    assert!(!store.entry_id_in_use(&ghost)?);
     Ok(())
 }
 
@@ -325,7 +252,7 @@ fn retire_and_gc_with_retired_set() -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempfile::tempdir()?;
     let mut store = open_store(temp.path())?;
 
-    let alpha = FilesystemNodeId::new("alpha")?;
+    let alpha = FilesystemEntryId::new("alpha")?;
     let v1 = store
         .write()
         .set::<Lifecycle<LifeState>>(&alpha, LifeState::Active)
@@ -350,7 +277,7 @@ fn only_keep_retires_all_except_specified() -> Result<(), Box<dyn std::error::Er
     let temp = tempfile::tempdir()?;
     let mut store = open_store(temp.path())?;
 
-    let alpha = FilesystemNodeId::new("alpha")?;
+    let alpha = FilesystemEntryId::new("alpha")?;
     let v1 = store
         .write()
         .set::<Lifecycle<LifeState>>(&alpha, LifeState::Active)
@@ -379,7 +306,7 @@ fn live_versions_excludes_retired() -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempfile::tempdir()?;
     let mut store = open_store(temp.path())?;
 
-    let alpha = FilesystemNodeId::new("alpha")?;
+    let alpha = FilesystemEntryId::new("alpha")?;
     let v1 = store.write().set::<Lifecycle<LifeState>>(&alpha, LifeState::Active).commit()?;
     let v2 = store.write().set::<TitleField>(&alpha, "hello".to_owned()).commit()?;
 
@@ -396,21 +323,20 @@ fn reopen_store_recovers_current_version() -> Result<(), Box<dyn std::error::Err
 
     let v_final = {
         let mut store = open_store(temp.path())?;
-        let alpha = FilesystemNodeId::new("alpha")?;
+        let alpha = FilesystemEntryId::new("alpha")?;
         store
             .write()
             .set::<Lifecycle<LifeState>>(&alpha, LifeState::Active)
             .set::<TitleField>(&alpha, "Alpha".to_owned())
             .commit()?;
-        let v = store.write().set::<TitleField>(&alpha, "Updated".to_owned()).commit()?;
-        v
+        store.write().set::<TitleField>(&alpha, "Updated".to_owned()).commit()?
     };
 
     // Re-open the same directory.
     let store2 = open_store(temp.path())?;
     assert_eq!(store2.current_version()?, v_final);
 
-    let alpha = FilesystemNodeId::new("alpha")?;
+    let alpha = FilesystemEntryId::new("alpha")?;
     assert_eq!(
         store2.resolve::<TitleField>(v_final, &alpha)?,
         Resolution::Content("Updated".to_owned())
@@ -423,7 +349,7 @@ fn gc_preserves_reads_through_live_versions() -> Result<(), Box<dyn std::error::
     let temp = tempfile::tempdir()?;
     let mut store = open_store(temp.path())?;
 
-    let alpha = FilesystemNodeId::new("alpha")?;
+    let alpha = FilesystemEntryId::new("alpha")?;
     let v1 = store
         .write()
         .set::<Lifecycle<LifeState>>(&alpha, LifeState::Active)
@@ -447,23 +373,23 @@ fn gc_preserves_reads_through_live_versions() -> Result<(), Box<dyn std::error::
 }
 
 #[test]
-fn filesystem_node_id_rejects_invalid_values() {
-    assert!(FilesystemNodeId::new("").is_err());
-    assert!(FilesystemNodeId::new(".").is_err());
-    assert!(FilesystemNodeId::new("..").is_err());
-    assert!(FilesystemNodeId::new("a/b").is_err());
-    assert!(FilesystemNodeId::new("a\0b").is_err());
-    assert!(FilesystemNodeId::new("a".repeat(256)).is_err());
+fn filesystem_entry_id_rejects_invalid_values() {
+    assert!(FilesystemEntryId::new("").is_err());
+    assert!(FilesystemEntryId::new(".").is_err());
+    assert!(FilesystemEntryId::new("..").is_err());
+    assert!(FilesystemEntryId::new("a/b").is_err());
+    assert!(FilesystemEntryId::new("a\0b").is_err());
+    assert!(FilesystemEntryId::new("a".repeat(256)).is_err());
     // Valid ids should succeed.
-    assert!(FilesystemNodeId::new("valid-id").is_ok());
-    assert!(FilesystemNodeId::new("a".repeat(255)).is_ok());
+    assert!(FilesystemEntryId::new("valid-id").is_ok());
+    assert!(FilesystemEntryId::new("a".repeat(255)).is_ok());
 }
 
 #[test]
-fn field_history_empty_for_node_with_no_writes() -> Result<(), Box<dyn std::error::Error>> {
+fn field_history_empty_for_entry_with_no_writes() -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempfile::tempdir()?;
     let store = open_store(temp.path())?;
-    let ghost = FilesystemNodeId::new("ghost")?;
+    let ghost = FilesystemEntryId::new("ghost")?;
     assert!(store.field_history::<TitleField>(&ghost)?.is_empty());
     Ok(())
 }
@@ -473,7 +399,7 @@ fn unchanged_fields_are_inherited_across_versions() -> Result<(), Box<dyn std::e
     let temp = tempfile::tempdir()?;
     let mut store = open_store(temp.path())?;
 
-    let alpha = FilesystemNodeId::new("alpha")?;
+    let alpha = FilesystemEntryId::new("alpha")?;
     let v1 = store
         .write()
         .set::<Lifecycle<LifeState>>(&alpha, LifeState::Active)
@@ -491,7 +417,7 @@ fn unchanged_fields_are_inherited_across_versions() -> Result<(), Box<dyn std::e
     );
     assert_eq!(store.resolve::<PriorityField>(v2, &alpha)?, Resolution::Content(99));
 
-    // The filesystem backend uses per-node storage: every write copies all fields
+    // The filesystem backend uses per-entry storage: every write copies all fields
     // into the new snapshot file. So field_history for title contains an entry at
     // every version, even though the value did not change at v2.
     assert_eq!(
