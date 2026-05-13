@@ -70,7 +70,7 @@ fn filesystem_backend_supports_static_user_defined_fields() -> Result<(), Box<dy
     );
 
     let v3 = store.write().delete::<AliasesField>(&alpha).commit()?;
-    assert_eq!(store.resolve::<AliasesField>(v3, &alpha)?, Resolution::Deleted);
+    assert_eq!(store.resolve::<AliasesField>(v3, &alpha)?, Resolution::Absent);
     assert_eq!(
         store.field_history::<AliasesField>(&alpha)?,
         vec![

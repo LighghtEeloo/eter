@@ -3,9 +3,9 @@
 //! Each registered [`Field`] gets its own named LMDB database. Two reserved
 //! databases track version history:
 //!
-//! - `_versions`: every committed version number (8-byte big-endian key, empty
-//!   value). The last entry is the current version; avoids a full field-table
-//!   scan on every write.
+//! - `_versions`: retained version numbers (8-byte big-endian key, empty
+//!   value). The last entry is the current retained version.
+//! - `_high_water`: the largest version number ever allocated by this backend.
 //! - `_retired`: the persistent retired-version set. Survives process restarts,
 //!   unlike the filesystem backend's in-memory retired set.
 //!
@@ -32,6 +32,8 @@ use tracing::trace;
 use crate::{
     Eter, Eterator, Field, FieldRow, GcOption, Lifecycle, Resolution, VersionedRow, WriteTxn,
 };
+
+const HIGH_WATER_KEY: &[u8] = b"high_water";
 
 // ---------------------------------------------------------------------------
 // LmdbKey trait
@@ -128,6 +130,9 @@ pub enum LmdbError {
     /// A key in `_versions` or `_retired` is not exactly 8 bytes.
     #[error("invalid version key in lmdb store")]
     InvalidVersionKey,
+    /// The requested snapshot is no longer retained by the store.
+    #[error("invalid or collected snapshot version: {0:?}")]
+    InvalidSnapshot(Eterator),
 }
 
 // ---------------------------------------------------------------------------
@@ -157,11 +162,15 @@ impl LmdbFieldConfig {
     ///
     /// # Panics
     ///
-    /// Panics if `name` is empty, reserved (`_versions`, `_retired`), or
+    /// Panics if `name` is empty, reserved (`_versions`, `_retired`,
+    /// `_high_water`), or
     /// if the field type or name has already been registered.
     pub fn with_field<F: Field>(mut self, name: &'static str) -> Self {
         assert!(!name.is_empty(), "lmdb field name must not be empty");
-        assert!(name != "_versions" && name != "_retired", "field name '{name}' is reserved");
+        assert!(
+            name != "_versions" && name != "_retired" && name != "_high_water",
+            "field name '{name}' is reserved"
+        );
         let tid = TypeId::of::<F>();
         assert!(!self.by_type.contains_key(&tid), "field type already registered");
         assert!(
@@ -198,14 +207,25 @@ where
     /// One database per registered [`Field`] type, keyed by [`TypeId`].
     field_dbs: HashMap<TypeId, Database<Bytes, Bytes>>,
     /// `_versions`: 8-byte big-endian version → empty value.
-    /// The last entry is the current version; updated atomically with every commit.
+    /// The last entry is the current retained version; commits insert here
+    /// atomically and GC removes versions that no longer have field rows.
     versions_db: Database<Bytes, Bytes>,
+    /// `_high_water`: fixed key → 8-byte big-endian version.
+    /// This database prevents version-number reuse after the newest retained
+    /// versions have been garbage-collected.
+    high_water_db: Database<Bytes, Bytes>,
     /// `_retired`: 8-byte big-endian version → empty value.
     /// Persisted across restarts; entries are removed when the corresponding
     /// version is fully collected by GC.
     retired_db: Database<Bytes, Bytes>,
-    /// Cached current version; kept in sync with `versions_db` on every commit and GC.
+    /// Cached maximum retained version.
+    ///
+    /// Kept in sync with `versions_db` on every commit and GC pass.
     current: Eterator,
+    /// Cached allocation high-water mark.
+    ///
+    /// This value only moves forward.
+    high_water: Eterator,
     _phantom: std::marker::PhantomData<(Id, L)>,
 }
 
@@ -230,7 +250,7 @@ where
             "lmdb backend requires Lifecycle<L> field registration"
         );
 
-        let max_dbs = (config.entries.len() + 2) as u32;
+        let max_dbs = (config.entries.len() + 3) as u32;
 
         // Safety: the caller owns the environment path; no other process or
         // thread should open the same environment simultaneously.
@@ -246,21 +266,37 @@ where
         }
         let versions_db: Database<Bytes, Bytes> =
             env.create_database(&mut wtxn, Some("_versions"))?;
+        let high_water_db: Database<Bytes, Bytes> =
+            env.create_database(&mut wtxn, Some("_high_water"))?;
         let retired_db: Database<Bytes, Bytes> =
             env.create_database(&mut wtxn, Some("_retired"))?;
         wtxn.commit()?;
 
         let rtxn = env.read_txn()?;
         let current = scan_last_version(versions_db, &rtxn)?;
+        let stored_high_water = read_high_water(high_water_db, &rtxn)?;
+        let high_water = stored_high_water.unwrap_or(current).max(current);
         drop(rtxn);
 
-        trace!("lmdb open: current_version={}", current.version());
+        if stored_high_water != Some(high_water) {
+            let mut wtxn = env.write_txn()?;
+            put_high_water(high_water_db, &mut wtxn, high_water)?;
+            wtxn.commit()?;
+        }
+
+        trace!(
+            "lmdb open: current_version={} high_water={}",
+            current.version(),
+            high_water.version()
+        );
         Ok(Self {
             env,
             field_dbs,
             versions_db,
+            high_water_db,
             retired_db,
             current,
+            high_water,
             _phantom: std::marker::PhantomData,
         })
     }
@@ -270,6 +306,27 @@ where
             .field_dbs
             .get(&TypeId::of::<F>())
             .unwrap_or_else(|| panic!("field type not registered in lmdb backend"))
+    }
+
+    fn next_version(&self) -> Eterator {
+        Eterator(
+            self.high_water
+                .version()
+                .checked_add(1)
+                .unwrap_or_else(|| panic!("lmdb version space exhausted")),
+        )
+    }
+
+    fn ensure_retained_snapshot_in(&self, rtxn: &RoTxn<'_>, at: Eterator) -> Result<(), LmdbError> {
+        if at == Eterator::EMPTY {
+            return Ok(());
+        }
+        let key = encode_version_key(at);
+        if self.versions_db.get(rtxn, &key)?.is_some() {
+            Ok(())
+        } else {
+            Err(LmdbError::InvalidSnapshot(at))
+        }
     }
 
     /// Open a read-only transaction on the underlying LMDB environment.
@@ -317,6 +374,7 @@ where
     pub fn resolve_in<F: Field>(
         &self, rtxn: &RoTxn<'_>, entry: &Id, at: Eterator,
     ) -> Result<Resolution<F::Content>, LmdbError> {
+        self.ensure_retained_snapshot_in(rtxn, at)?;
         let db = self.field_db_or_panic::<F>();
         let prefix = entry_prefix::<Id>(entry);
 
@@ -407,6 +465,19 @@ fn scan_last_version(
     }
 }
 
+fn read_high_water(
+    high_water_db: Database<Bytes, Bytes>, rtxn: &RoTxn<'_>,
+) -> Result<Option<Eterator>, LmdbError> {
+    high_water_db.get(rtxn, HIGH_WATER_KEY)?.map(decode_version_key).transpose()
+}
+
+fn put_high_water(
+    high_water_db: Database<Bytes, Bytes>, wtxn: &mut RwTxn<'_>, version: Eterator,
+) -> Result<(), LmdbError> {
+    high_water_db.put(wtxn, HIGH_WATER_KEY, &encode_version_key(version))?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Write transaction
 // ---------------------------------------------------------------------------
@@ -460,7 +531,7 @@ where
             return Ok(self.store.current);
         }
 
-        let next = Eterator(self.store.current.version() + 1);
+        let next = self.store.next_version();
         let version_be = encode_version_key(next);
 
         let mut wtxn: RwTxn<'_> = self.store.env.write_txn()?;
@@ -478,9 +549,11 @@ where
         }
 
         self.store.versions_db.put(&mut wtxn, &version_be, &[])?;
+        put_high_water(self.store.high_water_db, &mut wtxn, next)?;
         wtxn.commit()?;
 
         self.store.current = next;
+        self.store.high_water = next;
         trace!("lmdb commit end: version={}", next.version());
         Ok(next)
     }
@@ -564,6 +637,16 @@ where
 
     fn retire(&mut self, versions: impl IntoIterator<Item = Eterator>) -> Result<(), Self::Error> {
         trace!("lmdb retire begin");
+        let versions = versions.into_iter().collect::<Vec<_>>();
+        {
+            let rtxn = self.env.read_txn()?;
+            for version in &versions {
+                if *version == Eterator::EMPTY {
+                    return Err(LmdbError::InvalidSnapshot(*version));
+                }
+                self.ensure_retained_snapshot_in(&rtxn, *version)?;
+            }
+        }
         let mut wtxn = self.env.write_txn()?;
         for v in versions {
             self.retired_db.put(&mut wtxn, &encode_version_key(v), &[])?;
@@ -584,6 +667,11 @@ where
             let rtxn = self.env.read_txn()?;
             self.all_store_versions_in(&rtxn)?
         };
+        for version in &keep {
+            if *version == Eterator::EMPTY || !all.contains(version) {
+                return Err(LmdbError::InvalidSnapshot(*version));
+            }
+        }
 
         let mut wtxn = self.env.write_txn()?;
         for v in all {
@@ -606,7 +694,14 @@ where
             let retired = self.all_retired_versions_in(&rtxn)?;
             let live: BTreeSet<Eterator> = match option {
                 | GcOption::UseRetiredSet => all.difference(&retired).copied().collect(),
-                | GcOption::UseLiveSet(live_set) => live_set,
+                | GcOption::UseLiveSet(live_set) => {
+                    for version in &live_set {
+                        if *version == Eterator::EMPTY || !all.contains(version) {
+                            return Err(LmdbError::InvalidSnapshot(*version));
+                        }
+                    }
+                    live_set
+                }
             };
 
             let mut map: HashMap<TypeId, Vec<Vec<u8>>> = HashMap::new();
@@ -628,7 +723,7 @@ where
         }
 
         // Find which version numbers still have at least one row in any field
-        // db after the deletions.  Then prune _versions and _retired for any
+        // db after the deletions. Then prune _versions and _retired for any
         // version that no longer appears in any field db.
         //
         // We collect remaining versions by scanning field dbs now (after
@@ -666,7 +761,11 @@ where
         self.current = scan_last_version(self.versions_db, &rtxn)?;
         drop(rtxn);
 
-        trace!("lmdb gc end: current_version={}", self.current.version());
+        trace!(
+            "lmdb gc end: current_version={} high_water={}",
+            self.current.version(),
+            self.high_water.version()
+        );
         Ok(())
     }
 
@@ -704,6 +803,7 @@ where
         trace!("lmdb live_entries begin: at={}", at.version());
         let lifecycle_db = self.field_db_or_panic::<Lifecycle<L>>();
         let rtxn = self.env.read_txn()?;
+        self.ensure_retained_snapshot_in(&rtxn, at)?;
         let mut live = BTreeSet::new();
 
         let mut current_prefix: Vec<u8> = Vec::new();
@@ -987,6 +1087,29 @@ mod tests {
         };
         let store = open(&dir);
         assert!(store.retired_versions().unwrap().contains(&v1));
+    }
+
+    #[test]
+    fn high_water_persists_across_gc_and_reopen() {
+        let dir = TempDir::new().unwrap();
+        let (v1, v2) = {
+            let mut store = open(&dir);
+            let v1 = store.write().set::<Lifecycle<State>>(&id(1), State::Active).commit().unwrap();
+            let v2 = store.write().set::<CountField>(&id(1), 10).commit().unwrap();
+            store.only_keep([v1]).unwrap();
+            store.gc(GcOption::UseRetiredSet).unwrap();
+            assert_eq!(store.current_version().unwrap(), v1);
+            assert!(matches!(
+                store.resolve::<CountField>(v2, &id(1)),
+                Err(LmdbError::InvalidSnapshot(version)) if version == v2
+            ));
+            (v1, v2)
+        };
+
+        let mut reopened = open(&dir);
+        assert_eq!(reopened.current_version().unwrap(), v1);
+        let v3 = reopened.write().set::<CountField>(&id(1), 20).commit().unwrap();
+        assert_eq!(v3.version(), v2.version() + 1);
     }
 
     // --- garbage collection ---

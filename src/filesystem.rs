@@ -2,12 +2,14 @@
 //!
 //! Storage layout:
 //! - `<root>/<entry_id>/<version>-<entry_id>.md`
+//! - `<root>/.eter-high-water`
 //! - `version` is a 64-bit value encoded as 16 lowercase hex digits.
 //! - each file contains YAML frontmatter and a markdown body.
 //!
-//! Frontmatter stores protocol fields by key. A `null` value is a
-//! [`FieldRow::Deleted`](crate::FieldRow::Deleted) marker, while an absent key
-//! means the field is inherited from older snapshots during resolution.
+//! Frontmatter stores protocol fields by key. A key's presence means the field
+//! has content in that full-entry snapshot; omitting the key means the field is
+//! absent. Normal backend writes copy unchanged values forward, so omission is
+//! used for deletion rather than sparse inheritance.
 //!
 //! This backend stores one markdown file per `(EntryId, version)` snapshot. It
 //! keeps no persistent retired-version state on disk. Retired/live version
@@ -26,8 +28,11 @@ use thiserror::Error;
 use tracing::trace;
 
 use crate::{
-    Eter, Eterator, Field, FieldRow, GcOption, Lifecycle, Resolution, VersionedRow, WriteTxn,
+    Eter, Eterator, Field, FieldRow, GcOption, Lifecycle, LiveEntries, Resolution, VersionedRow,
+    WriteTxn,
 };
+
+const HIGH_WATER_FILENAME: &str = ".eter-high-water";
 
 type DecodedSnapshot = (Eterator, Map<String, Value>, String);
 
@@ -144,9 +149,12 @@ impl FilesystemFieldRegistry {
 /// `EntryId` is represented as [`FilesystemEntryId`] and validated for path safety.
 /// `Lifecycle` state type is user-defined.
 ///
-/// A write creates a full entry snapshot at the next global version: updated
-/// fields are written from the transaction and unchanged fields are copied from
-/// the latest earlier snapshot for that entry.
+/// A write creates a full entry snapshot at the next allocated version:
+/// updated fields are written from the transaction and unchanged fields are
+/// copied from the latest earlier snapshot for that entry.
+///
+/// Note: this backend keeps the retired-version set only in memory. Reopening a
+/// filesystem store starts with no retired versions.
 #[derive(Debug)]
 pub struct FilesystemBackend<L>
 where
@@ -156,6 +164,7 @@ where
     fields: FilesystemFieldRegistry,
     retired: BTreeSet<Eterator>,
     current: Eterator,
+    high_water: Eterator,
     _lifecycle: std::marker::PhantomData<L>,
 }
 
@@ -171,6 +180,9 @@ where
     ///
     /// The returned backend starts with an empty in-memory retired set, even
     /// when opening an existing store.
+    ///
+    /// Note: opening an existing store may create or repair `.eter-high-water`
+    /// so future writes do not reuse a collected version number.
     ///
     /// Note: retired versions are not persisted by this backend. Callers own
     /// live/retired bookkeeping across process restarts.
@@ -197,14 +209,62 @@ where
         }
 
         let current = Self::scan_current_version(&root)?;
-        trace!("filesystem open end: current_version={}", current.version());
+        let stored_high_water = Self::read_high_water(&root)?;
+        let high_water = stored_high_water.unwrap_or(current).max(current);
+        if stored_high_water != Some(high_water) {
+            Self::persist_high_water_to(&root, high_water)?;
+        }
+        trace!(
+            "filesystem open end: current_version={} high_water={}",
+            current.version(),
+            high_water.version()
+        );
         Ok(Self {
             root,
             fields,
             retired: BTreeSet::new(),
             current,
+            high_water,
             _lifecycle: std::marker::PhantomData,
         })
+    }
+
+    fn high_water_path(root: &Path) -> PathBuf {
+        root.join(HIGH_WATER_FILENAME)
+    }
+
+    fn read_high_water(root: &Path) -> Result<Option<Eterator>, FilesystemError> {
+        let path = Self::high_water_path(root);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let text = fs::read_to_string(path)?;
+        let trimmed = text.trim();
+        if trimmed.len() != 16 {
+            return Err(FilesystemError::InvalidHighWater(text));
+        }
+        let version = u64::from_str_radix(trimmed, 16)
+            .map_err(|_| FilesystemError::InvalidHighWater(text))?;
+        Ok(Some(Eterator(version)))
+    }
+
+    fn persist_high_water_to(root: &Path, version: Eterator) -> Result<(), FilesystemError> {
+        let path = Self::high_water_path(root);
+        fs::write(path, format!("{:016x}\n", version.version()))?;
+        Ok(())
+    }
+
+    fn persist_high_water(&self, version: Eterator) -> Result<(), FilesystemError> {
+        Self::persist_high_water_to(&self.root, version)
+    }
+
+    fn next_version(&self) -> Eterator {
+        Eterator(
+            self.high_water
+                .version()
+                .checked_add(1)
+                .unwrap_or_else(|| panic!("filesystem version space exhausted")),
+        )
     }
 
     fn entry_dir(&self, entry: &FilesystemEntryId) -> PathBuf {
@@ -230,6 +290,7 @@ where
     }
 
     fn encode_snapshot(header: &Map<String, Value>, body: &str) -> Result<String, FilesystemError> {
+        Self::validate_header(header)?;
         let yaml = serde_yaml::to_string(header)?;
         Ok(format!("---\n{yaml}---\n\n{body}"))
     }
@@ -241,7 +302,15 @@ where
         let yaml = &rest[..idx];
         let body = rest[idx + sep.len()..].strip_prefix('\n').unwrap_or(&rest[idx + sep.len()..]);
         let header: Map<String, Value> = serde_yaml::from_str(yaml)?;
+        Self::validate_header(&header)?;
         Ok((header, body.to_owned()))
+    }
+
+    fn validate_header(header: &Map<String, Value>) -> Result<(), FilesystemError> {
+        if let Some((key, _)) = header.iter().find(|(_, value)| value.is_null()) {
+            return Err(FilesystemError::NullFieldValue(key.clone()));
+        }
+        Ok(())
     }
 
     fn list_entry_versions(
@@ -340,6 +409,17 @@ where
         Ok(versions)
     }
 
+    fn ensure_retained_snapshot(&self, at: Eterator) -> Result<(), FilesystemError> {
+        if at == Eterator::EMPTY {
+            return Ok(());
+        }
+        if self.all_versions()?.contains(&at) {
+            Ok(())
+        } else {
+            Err(FilesystemError::InvalidSnapshot(at))
+        }
+    }
+
     fn field_key_or_panic<F: Field>(&self) -> &str {
         self.fields
             .key_for::<F>()
@@ -356,6 +436,7 @@ where
     ) -> Result<Resolution<String>, FilesystemError> {
         trace!("filesystem resolve_body begin: at={} entry={entry}", at.version());
         FilesystemEntryId::validate(entry.as_str())?;
+        self.ensure_retained_snapshot(at)?;
         let result = match self.latest_snapshot_at(entry, at)? {
             | Some((_, _, body)) => Resolution::Content(body),
             | None => Resolution::Absent,
@@ -379,9 +460,18 @@ pub enum FilesystemError {
     /// Version filename does not match `<version>-<entry_id>.md`.
     #[error("invalid version filename: {0}")]
     InvalidFilename(String),
+    /// Persisted high-water version metadata is malformed.
+    #[error("invalid high-water version metadata: {0:?}")]
+    InvalidHighWater(String),
+    /// The requested snapshot is no longer retained by the store.
+    #[error("invalid or collected snapshot version: {0:?}")]
+    InvalidSnapshot(Eterator),
     /// Markdown frontmatter is malformed.
     #[error("invalid frontmatter format")]
     InvalidFrontmatter,
+    /// A frontmatter key has a null value.
+    #[error("null frontmatter value for field: {0}")]
+    NullFieldValue(String),
     /// Filesystem I/O error.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -449,6 +539,10 @@ where
             | FieldRow::Content(value) => {
                 let json = serde_json::to_value(value)
                     .unwrap_or_else(|err| panic!("failed to serialize field content: {err}"));
+                assert!(
+                    !json.is_null(),
+                    "filesystem field content serialized to null; delete the field by omitting it"
+                );
                 FieldRow::Content(json)
             }
             | FieldRow::Deleted => FieldRow::Deleted,
@@ -465,7 +559,9 @@ where
             return Ok(self.store.current);
         }
 
-        let next = Eterator(self.store.current.version() + 1);
+        let next = self.store.next_version();
+        self.store.persist_high_water(next)?;
+        self.store.high_water = next;
         for (entry, updates) in self.pending {
             let previous = self.store.latest_snapshot_at(&entry, self.store.current)?;
             let (mut header, body) = match previous {
@@ -478,7 +574,7 @@ where
                         header.insert(key, value);
                     }
                     | FieldRow::Deleted => {
-                        header.insert(key, Value::Null);
+                        header.remove(&key);
                     }
                 }
             }
@@ -508,10 +604,10 @@ where
     ) -> Result<Resolution<F::Content>, Self::Error> {
         trace!("filesystem resolve begin: at={} entry={entry}", at.version());
         FilesystemEntryId::validate(entry.as_str())?;
+        self.ensure_retained_snapshot(at)?;
         let key = self.field_key_or_panic::<F>();
         let result = match self.latest_snapshot_at(entry, at)? {
             | Some((_, header, _)) => match header.get(key) {
-                | Some(value) if value.is_null() => Resolution::Deleted,
                 | Some(value) => Resolution::Content(serde_json::from_value(value.clone())?),
                 | None => Resolution::Absent,
             },
@@ -540,16 +636,17 @@ where
         FilesystemEntryId::validate(entry.as_str())?;
         let key = self.field_key_or_panic::<F>();
         let mut out = Vec::new();
+        let mut was_present = false;
         for (version, path) in self.list_entry_versions(entry)? {
             let text = fs::read_to_string(path)?;
             let (header, _) = Self::decode_snapshot(&text)?;
             if let Some(value) = header.get(key) {
-                let row = if value.is_null() {
-                    FieldRow::Deleted
-                } else {
-                    FieldRow::Content(serde_json::from_value(value.clone())?)
-                };
+                let row = FieldRow::Content(serde_json::from_value(value.clone())?);
                 out.push((version, row));
+                was_present = true;
+            } else if was_present {
+                out.push((version, FieldRow::Deleted));
+                was_present = false;
             }
         }
         trace!("filesystem field_history end: rows={}", out.len());
@@ -583,6 +680,13 @@ where
 
     fn retire(&mut self, versions: impl IntoIterator<Item = Eterator>) -> Result<(), Self::Error> {
         trace!("filesystem retire begin");
+        let versions = versions.into_iter().collect::<Vec<_>>();
+        let retained = self.all_versions()?;
+        for version in &versions {
+            if *version == Eterator::EMPTY || !retained.contains(version) {
+                return Err(FilesystemError::InvalidSnapshot(*version));
+            }
+        }
         self.retired.extend(versions);
         trace!("filesystem retire end: retired={}", self.retired.len());
         Ok(())
@@ -594,6 +698,11 @@ where
         trace!("filesystem only_keep begin");
         let keep: BTreeSet<Eterator> = versions.into_iter().collect();
         let all = self.all_versions()?;
+        for version in &keep {
+            if *version == Eterator::EMPTY || !all.contains(version) {
+                return Err(FilesystemError::InvalidSnapshot(*version));
+            }
+        }
         self.retired = all.into_iter().filter(|v| !keep.contains(v)).collect();
         trace!("filesystem only_keep end: retired={}", self.retired.len());
         Ok(())
@@ -608,7 +717,14 @@ where
                 .copied()
                 .filter(|version| !self.retired.contains(version))
                 .collect::<BTreeSet<_>>(),
-            | GcOption::UseLiveSet(live) => live,
+            | GcOption::UseLiveSet(live) => {
+                for version in &live {
+                    if *version == Eterator::EMPTY || !all_versions.contains(version) {
+                        return Err(FilesystemError::InvalidSnapshot(*version));
+                    }
+                }
+                live
+            }
         };
 
         for entry in self.scan_entry_ids()? {
@@ -630,7 +746,11 @@ where
             }
         }
         self.current = Self::scan_current_version(&self.root)?;
-        trace!("filesystem gc end: current_version={}", self.current.version());
+        trace!(
+            "filesystem gc end: current_version={} high_water={}",
+            self.current.version(),
+            self.high_water.version()
+        );
         Ok(())
     }
 
@@ -644,6 +764,29 @@ where
         let all = self.all_versions()?;
         let live = all.into_iter().filter(|version| !self.retired.contains(version)).collect();
         trace!("filesystem live_versions end");
+        Ok(live)
+    }
+}
+
+impl<L> LiveEntries for FilesystemBackend<L>
+where
+    L: Clone + Debug + Serialize + DeserializeOwned + 'static,
+{
+    /// Return all entries whose lifecycle field resolves to content at `at`.
+    ///
+    /// This implementation scans entry directories and resolves lifecycle for
+    /// each candidate. It is intended for single-user filesystem stores where
+    /// entry enumeration is needed for projection commits and checkouts.
+    fn live_entries(&self, at: Eterator) -> Result<BTreeSet<Self::EntryId>, Self::Error> {
+        trace!("filesystem live_entries begin: at={}", at.version());
+        self.ensure_retained_snapshot(at)?;
+        let mut live = BTreeSet::new();
+        for entry in self.scan_entry_ids()? {
+            if self.entry_exists(at, &entry)? {
+                live.insert(entry);
+            }
+        }
+        trace!("filesystem live_entries end: count={}", live.len());
         Ok(live)
     }
 }
@@ -665,7 +808,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Eter, Eterator, GcOption, Lifecycle, Resolution, WriteTxn};
+    use crate::{
+        EntryFacet, EntryFacetStoreExt, Eter, Eterator, GcOption, Lifecycle, LiveEntries,
+        Resolution, WriteTxn,
+    };
     use serde::{Deserialize, Serialize};
 
     // -- Helpers --
@@ -694,6 +840,71 @@ mod tests {
 
     fn entry(s: &str) -> FilesystemEntryId {
         FilesystemEntryId::new(s).unwrap()
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct NoteFacet {
+        tag: String,
+        count: u32,
+    }
+
+    impl EntryFacet<FilesystemBackend<State>> for NoteFacet {
+        fn load_from(
+            store: &FilesystemBackend<State>, at: Eterator, id: &FilesystemEntryId,
+        ) -> Result<Option<Self>, FilesystemError> {
+            if !store.entry_exists(at, id)? {
+                return Ok(None);
+            }
+            let tag = match store.resolve::<TagField>(at, id)? {
+                | Resolution::Content(value) => value,
+                | Resolution::Deleted | Resolution::Absent => {
+                    panic!("note entry is missing required tag field")
+                }
+            };
+            let count = match store.resolve::<CountField>(at, id)? {
+                | Resolution::Content(value) => value,
+                | Resolution::Deleted | Resolution::Absent => {
+                    panic!("note entry is missing required count field")
+                }
+            };
+            Ok(Some(Self { tag, count }))
+        }
+
+        fn apply_to<'a>(
+            &self, txn: FilesystemWriteTxn<'a, State>, id: &FilesystemEntryId,
+        ) -> FilesystemWriteTxn<'a, State>
+        where
+            FilesystemBackend<State>: 'a,
+        {
+            txn.set::<Lifecycle<State>>(id, State::Active)
+                .set::<TagField>(id, self.tag.clone())
+                .set::<CountField>(id, self.count)
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct TagFacet {
+        tag: String,
+    }
+
+    impl EntryFacet<FilesystemBackend<State>> for TagFacet {
+        fn load_from(
+            store: &FilesystemBackend<State>, at: Eterator, id: &FilesystemEntryId,
+        ) -> Result<Option<Self>, FilesystemError> {
+            match store.resolve::<TagField>(at, id)? {
+                | Resolution::Content(tag) => Ok(Some(Self { tag })),
+                | Resolution::Deleted | Resolution::Absent => Ok(None),
+            }
+        }
+
+        fn apply_to<'a>(
+            &self, txn: FilesystemWriteTxn<'a, State>, id: &FilesystemEntryId,
+        ) -> FilesystemWriteTxn<'a, State>
+        where
+            FilesystemBackend<State>: 'a,
+        {
+            txn.set::<TagField>(id, self.tag.clone())
+        }
     }
 
     // -- FilesystemEntryId --
@@ -812,12 +1023,21 @@ mod tests {
     }
 
     #[test]
-    fn encode_decode_null_deletion_marker() {
+    fn encode_snapshot_rejects_null_frontmatter_value() {
         let mut header = serde_json::Map::new();
         header.insert("tag".to_owned(), serde_json::Value::Null);
-        let encoded = FilesystemBackend::<State>::encode_snapshot(&header, "").unwrap();
-        let (decoded, _) = FilesystemBackend::<State>::decode_snapshot(&encoded).unwrap();
-        assert!(decoded["tag"].is_null());
+        assert!(matches!(
+            FilesystemBackend::<State>::encode_snapshot(&header, ""),
+            Err(FilesystemError::NullFieldValue(key)) if key == "tag"
+        ));
+    }
+
+    #[test]
+    fn decode_snapshot_rejects_null_frontmatter_value() {
+        assert!(matches!(
+            FilesystemBackend::<State>::decode_snapshot("---\ntag: null\n---\n"),
+            Err(FilesystemError::NullFieldValue(key)) if key == "tag"
+        ));
     }
 
     #[test]
@@ -900,6 +1120,30 @@ mod tests {
         assert!(FilesystemBackend::<State>::open(&file_path, registry).is_err());
     }
 
+    #[test]
+    fn high_water_persists_across_gc_and_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = entry("a");
+        let (v1, v2) = {
+            let mut store = open(temp.path());
+            let v1 = store.write().set::<Lifecycle<State>>(&a, State::Active).commit().unwrap();
+            let v2 = store.write().set::<TagField>(&a, "old".to_owned()).commit().unwrap();
+            store.only_keep([v1]).unwrap();
+            store.gc(GcOption::UseRetiredSet).unwrap();
+            assert_eq!(store.current_version().unwrap(), v1);
+            assert!(matches!(
+                store.resolve::<TagField>(v2, &a),
+                Err(FilesystemError::InvalidSnapshot(version)) if version == v2
+            ));
+            (v1, v2)
+        };
+
+        let mut reopened = open(temp.path());
+        assert_eq!(reopened.current_version().unwrap(), v1);
+        let v3 = reopened.write().set::<TagField>(&a, "new".to_owned()).commit().unwrap();
+        assert_eq!(v3.version(), v2.version() + 1);
+    }
+
     // -- write / resolve / current_version --
 
     #[test]
@@ -933,18 +1177,56 @@ mod tests {
     }
 
     #[test]
-    fn resolve_deleted_field_returns_deleted() {
+    fn resolve_deleted_field_returns_absent_and_history_records_deletion() {
         let temp = tempfile::tempdir().unwrap();
         let mut store = open(temp.path());
         let a = entry("a");
-        store
+        let v1 = store
             .write()
             .set::<Lifecycle<State>>(&a, State::Active)
             .set::<TagField>(&a, "x".to_owned())
             .commit()
             .unwrap();
         let v2 = store.write().delete::<TagField>(&a).commit().unwrap();
-        assert_eq!(store.resolve::<TagField>(v2, &a).unwrap(), Resolution::Deleted);
+        assert_eq!(store.resolve::<TagField>(v2, &a).unwrap(), Resolution::Absent);
+        assert_eq!(
+            store.field_history::<TagField>(&a).unwrap(),
+            vec![(v1, FieldRow::Content("x".to_owned())), (v2, FieldRow::Deleted)]
+        );
+
+        let snapshots = store.list_entry_versions(&a).unwrap();
+        let (_, latest_path) = snapshots.last().unwrap();
+        let latest_text = fs::read_to_string(latest_path).unwrap();
+        assert!(!latest_text.contains("\ntag:"));
+        assert!(!latest_text.contains("null"));
+    }
+
+    #[test]
+    fn entry_facet_roundtrips_complete_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = open(temp.path());
+        let note_id = entry("note");
+        let note = NoteFacet { tag: "draft".to_owned(), count: 3 };
+
+        let version = store.write_facet(&note_id, &note).unwrap();
+        let loaded = store.load_facet::<NoteFacet>(version, &note_id).unwrap();
+
+        assert_eq!(loaded, Some(note));
+    }
+
+    #[test]
+    fn entry_facet_roundtrips_field_subset() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = open(temp.path());
+        let id = entry("note");
+        let v1 = store.write().set::<Lifecycle<State>>(&id, State::Active).commit().unwrap();
+        let facet = TagFacet { tag: "draft".to_owned() };
+
+        let v2 = store.write_facet(&id, &facet).unwrap();
+
+        assert!(store.entry_exists(v2, &id).unwrap());
+        assert_eq!(store.load_facet::<TagFacet>(v1, &id).unwrap(), None);
+        assert_eq!(store.load_facet::<TagFacet>(v2, &id).unwrap(), Some(facet));
     }
 
     #[test]
@@ -1050,6 +1332,24 @@ mod tests {
         let live = store.live_versions().unwrap();
         assert!(!live.contains(&v1));
         assert!(live.contains(&v2));
+    }
+
+    #[test]
+    fn live_entries_reports_lifecycle_content_at_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = open(temp.path());
+        let a = entry("a");
+        let b = entry("b");
+        let v1 = store
+            .write()
+            .set::<Lifecycle<State>>(&a, State::Active)
+            .set::<Lifecycle<State>>(&b, State::Active)
+            .commit()
+            .unwrap();
+        let v2 = store.write().delete::<Lifecycle<State>>(&b).commit().unwrap();
+
+        assert_eq!(store.live_entries(v1).unwrap(), BTreeSet::from([a.clone(), b.clone()]));
+        assert_eq!(store.live_entries(v2).unwrap(), BTreeSet::from([a]));
     }
 
     // -- gc --

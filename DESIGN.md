@@ -5,11 +5,15 @@ interface is defined as Rust traits and implemented by backends such as
 filesystem-backed stores and concurrent database engines. The name refers to
 immutable historical states.
 
-Users append history rather than mutating entries in place. `Eterator`s are
-stable handles to immutable snapshots of the entry store. Old states remain
+Users append history rather than mutating entries in place. Live `Eterator`s
+are stable handles to immutable snapshots of the entry store. Old states remain
 available for as long as the user chooses to keep them. The user may view old
 states or linearly revert to one of them and drop later updates. Undo-tree-like
 branching is delegated to external systems such as git or database snapshots.
+
+An application may keep a separate working folder beside the Eter store. The
+working folder is an unversioned projection of one entry set. The projection
+layer maps files to typed entry updates; Eter stores the resulting snapshots.
 
 The `Eterator` representation determines the storage model and the cost of
 historical reads. The desired properties are:
@@ -32,69 +36,117 @@ Three initial storage strategies define the trade space:
   retrieval; the only caveat is the version number may run out much faster than
   other strategies.
 
-Global versioning is the chosen strategy. Every write operation assigns a new
-version to every field row it produces. The current version is not stored as
-a separate counter; it is derived as the maximum version across all field
-rows in the store. A single operation may touch multiple entries and fields;
-all rows written in the same operation share the same version, providing
-atomic-snapshot semantics. An `Eterator` is therefore a single integer
-representing the version at the time the snapshot was created.
+Global versioning is the chosen strategy. Every non-empty write operation
+assigns the next version after the store's allocation high-water mark to every
+field row it produces. The logical current version is the maximum retained
+version in the store. Backends persist the high-water mark so collected version
+numbers are not reused. A single operation may touch multiple entries and
+fields; all rows written in the same operation share the same version,
+providing atomic-snapshot semantics. An `Eterator` is therefore a single
+integer representing a retained snapshot.
 
-A 64-bit version space yields ~1.8 × 10^19 versions. At one billion writes
-per second, exhaustion takes roughly 584 years.
+A 64-bit allocation version space yields ~1.8 × 10^19 versions. Without
+rollbacks that discard the newest versions, one billion writes per second
+would exhaust the space in roughly 584 years.
 
-Cross-entry derived data such as the current maximum version and live-entry
-sets may be cached in memory or auxiliary tables. No cache is authoritative;
-all are rebuildable from the field tables on startup and may be freely
-invalidated between server launches.
+Cross-entry derived data such as the current retained maximum version, version
+registries, and live-entry sets may be cached in memory or auxiliary tables.
+The allocation high-water mark is auxiliary persistent state. It is not entry
+content, but it is authoritative for future version allocation.
 
 ## Core Concepts
 
-`Eterator` is a snapshot handle: concretely, a global version number.
-The user receives a fresh `Eterator` after each write and may hold any number
-of them simultaneously. Each grants read access to the entry store as it
-existed at that version.
+`Eterator` is a snapshot handle: concretely, a global version number. The user
+receives an `Eterator` after each write and may hold any number of live
+versions simultaneously. Each live `Eterator` grants read access to the entry
+store as it existed at that version. A retired and collected version is no
+longer a valid snapshot handle. Backends reject reads through collected
+versions rather than resolving them against another retained snapshot.
 
 Entries are the basic units of the entry store. Each entry has a fixed,
-compile-time-defined set of fields, each backed by its own table. Every field
-row is keyed by `(EntryId, version)`. A row holds either content or a deletion
-marker. Only fields that change receive new rows on a write; unchanged fields
-are inherited from the nearest earlier version. Versioning is per-field, not
-per-entry. A write touching one field produces no new rows for unaffected
-fields. Resolution cost is one seek per field; storage cost is proportional to
-the number of changed fields per write.
+compile-time-defined set of fields. The protocol presents each field as a
+logical history keyed by `(EntryId, version)`. A row holds either content or a
+deletion marker. Resolution inherits unchanged fields from the nearest earlier
+row in that field's history. Backends may store sparse field rows or equivalent
+full-entry snapshots. Versioning is logical per-field even when the physical
+layout co-locates fields.
+
+Applications may define typed entry facets over those fields. An entry facet
+is a Rust type isomorphic to a coherent subset of fields for one entry. A
+facet loads and writes that subset by calling the field-level protocol. It
+owns required-field checks, defaults, presence rules, and domain invariants.
+It does not define file syntax.
 
 `EntryId` is the unique identifier for an entry. The concrete type is chosen by
 the user (e.g. UUIDv7, slug, integer). The only requirement is uniqueness
-within the store, verifiable through the `Eter` interface before insertion.
+within the store for fresh entries, verifiable through the `Eter` interface
+before insertion. Re-creating a deleted entry uses its existing `EntryId`.
 
-`Eter` is the store itself. Its only persistent global state is a set of
-retired versions. Every version not in the retired set is considered live and
-must be preserved. The user adds versions to the retired set explicitly, or
-uses an "only-keep" operation that retires everything except a given set of
-versions.
+`Eter` is the store itself. Version preservation is expressed through live and
+retired versions. In retired-set mode, every retained version not in the
+retired set is considered live and must be preserved. The user adds versions
+to the retired set explicitly, or uses an "only-keep" operation that retires
+everything except a given set of versions.
 
-This design favors safe failure: if the retired set fails to persist, the
-consequence is wasted space (versions that could be collected survive), never
-data loss. Tracking pinned versions instead and treating everything else as
-retired risks destroying live data on a failed write.
+When a backend persists the retired set, the failure mode is conservative: if
+the retired set fails to persist, versions that could be collected survive.
+Tracking pinned versions instead and treating everything else as retired risks
+destroying live data on a failed write.
 
-Alternatively, the store may hold no global state at all. The user provides
-an explicit set of live versions to each garbage-collection call, and the
-store treats everything else as retired for that invocation. This maximizes
-flexibility and eliminates persistent state, at the cost of placing version
-bookkeeping entirely in the user's hands. The two modes are compatible: the
-retired set is a convenience layer atop the stateless GC primitive.
+The store may also run garbage collection from an explicit live-version set.
+For that invocation, every retained version outside the supplied set is treated
+as retired. This mode places version bookkeeping in the caller's hands. The
+two modes are compatible: the retired set is a convenience layer atop the
+stateless GC primitive.
+
+## Application Folder Projection
+
+Folder-level operations belong to an application projection layer. A working
+folder is an unversioned materialization of an Eter snapshot. The Eter store
+is the durable snapshot store. A filesystem-backed store path must be distinct
+from the working folder and must not be discovered as an entry inside it.
+
+The projection layer owns the mapping from files to entries. It chooses which
+files belong to the entry set, parses entry ids, maps frontmatter or other
+document syntax to registered fields, supplies body text, renders files, and
+defines conflict policy. Eter receives typed entry updates after that mapping.
+Application syntax does not enter the core store protocol.
+
+A folder commit adapter may represent the selected working folder as the
+desired current entry set. Entries present in the working set are written with
+lifecycle content. Entries present at the previous version but absent from the
+working set receive a lifecycle deletion marker. Unchanged fields need not
+produce new logical content, but all rows written by the adapter share one
+global version.
+
+If the projected working set is identical to the current snapshot, the adapter
+returns the current `Eterator` and writes no new rows. Otherwise it returns the
+new `Eterator`. The working folder is not mutated by commit.
+
+A folder checkout adapter is the inverse projection. Given an `Eterator`, it
+resolves live entries at the selected version, renders them through the
+application's document syntax, and writes the resulting files to a target
+folder.
+
+Checkout may replace the target folder contents for the entry set it owns. The
+projection layer defines ownership boundaries, ignored files, and conflict
+policy. Eter provides snapshot reads; it does not decide which application
+files should survive checkout.
+
+Checkout is not a change to Eter history. It writes a working materialization
+of an existing snapshot. A later commit may import that folder and append a new
+snapshot.
 
 ## Resolution
 
 Reading field `F` of entry `N` at `Eterator(V)`:
 
-1. Seek to the row in `F`'s table with key `(N, v)` where `v` is the largest
+1. Verify that `V` is a retained snapshot version.
+2. Seek to the row in `F`'s table with key `(N, v)` where `v` is the largest
    version ≤ `V`.
-2. If the row contains content, return it.
-3. If the row is a deletion marker, the field is absent at this snapshot.
-4. If no row exists, the field has never been written for this entry.
+3. If the row contains content, return it.
+4. If the row is a deletion marker, return `Resolution::Deleted`.
+5. If no row exists, return `Resolution::Absent`.
 
 This is a single backward seek in a sorted key-value store, O(log k) where
 k is the number of versions for the `(N, F)` pair. Backends may additionally
@@ -110,58 +162,61 @@ resolves to a deletion marker or has never been written, the entry is absent.
 Other fields' state does not affect this determination.
 
 The value stored in `lifecycle` when present is user-defined. A minimal
-application uses a two-state enum (active, removed). Richer applications can
-encode additional states like archived, draft, or deprecated that carry meaning
-at the application layer without affecting protocol-level resolution. The
-protocol only distinguishes "has content" from "absent."
+application uses a unit-like active marker. Richer applications can encode
+states like archived, draft, or deprecated that carry meaning at the
+application layer without affecting protocol-level resolution. The protocol
+only distinguishes "has content" from "absent."
 
-A deleted `EntryId` may be reused: writing a new content row to `lifecycle`
-at a later version re-creates the entry.
-
+A deleted `EntryId` may be reactivated: writing a new content row to
+`lifecycle` at a later version re-creates the entry under the same identity.
 
 ## Garbage Collection
 
-Garbage collection is driven by the retired-version set (or, in stateless
-mode, by the complement of the live set supplied to a GC call). A field row
-at version `v` is collectible when every `Eterator` that would resolve to it
-has been retired, meaning a later row at version `v'` exists such that no
-live version falls in `(v, v')`. Concretely, given two consecutive live versions
-`V_a < V_b` and rows at `v1 < v2 < v3` all within `(V_a, V_b]`, rows `v1`
-and `v2` are redundant: any live `Eterator` in that interval resolves to
-`v3`. They can be freed.
+Garbage collection is driven by the retired-version set, or by the complement
+of the live set supplied to a stateless GC call. A field row at version `v`
+with successor row `v_next` serves live versions in `[v, v_next)`. If there is
+no successor row, it serves live versions in `[v, ∞)`. The row is collectible
+when this served range contains no live version.
+
+Given two consecutive live versions `V_a < V_b` and rows at `v1 < v2 < v3`
+all within `(V_a, V_b]`, rows `v1` and `v2` are redundant when `v3` is the row
+that resolves at `V_b`. They can be freed.
 
 Garbage collection never alters the result of a read through any live version.
 
 ## Optional Caches
 
-The field tables are the single source of truth. All other data structures
-are derived caches that may be dropped and rebuilt at any time.
+The retained field history is the single source of truth for entry content.
+All other data structures are derived caches or indices.
 
-- **Current version.** The maximum version across all rows. Avoids a full
-  scan on every write by caching and incrementing a single value.
+- **Current version.** The maximum retained version. Avoids a full scan when
+  answering `current_version`; updated on writes and rebuilt after GC or open
+  when needed.
+- **Allocation high-water mark.** The largest version number ever allocated by
+  the backend. It prevents reuse after GC removes the newest retained versions.
 - **Live-entry set.** The set of `EntryId`s whose `lifecycle` field resolves to
   content at a given version. Without this cache, enumerating live entries
   requires scanning the full `EntryId` space.
 - **Per-`Eterator` resolution map.** Precomputed `(EntryId, field) → version`
   mappings for frequently accessed snapshots.
 
-Backends decide which caches to maintain. By default all caches are invalidated
-on startup, but a backend may preserve them across restarts on a best-effort
-basis, for example by storing a checksum of the underlying field tables and
-skipping rebuild when the checksum matches. The protocol defines optional traits
-for backends that support specific caches but leaves the persistence and
-invalidation strategy to each backend.
+Backends decide which caches and derived indices to maintain. Derived indices
+may be invalidated on startup when they can be rebuilt or validated from
+retained field history. The allocation high-water mark is persisted by
+backends that can collect the newest retained versions. The protocol defines
+optional traits for backends that support specific derived views but leaves
+persistence and invalidation strategy to each backend.
 
 ## Concurrency
 
-The monotonic version sequence serializes writes into a total order.
+The version assigned to a write serializes retained writes into a total order.
 Strategies:
 
 - **Single-writer.** One writer holds exclusive access; readers use their
   `Eterator` snapshots without coordination. Sufficient when write throughput
   is not a bottleneck.
 - **Compare-and-swap.** Writers prepare a batch optimistically, then CAS the
-  cached current version. On conflict, retry.
+  cached allocation high-water mark. On conflict, retry.
 - **Batched writes.** Multiple field mutations share a single version,
   conserving version space.
 
@@ -170,13 +225,13 @@ concern.
 
 ## Backend Considerations
 
-The storage model relies on ordered `(EntryId, field, version)` keys, prefix
-scans, and backward seeks. These requirements point toward sorted key-value
-stores.
+Database backends can map the logical field histories to ordered
+`(EntryId, field, version)` keys, prefix scans, and backward seeks. These
+requirements point toward sorted key-value stores.
 
-- **Filesystem**: Each entry is a directory, each field a file, versions
-  encoded in filenames or appended entries. No concurrency support; suitable
-  for single-user, human-readable scenarios.
+- **Filesystem**: Each entry is a directory in a history root, with versions
+  encoded in filenames. No concurrency support; suitable for single-user,
+  human-readable history stores.
 - **LMDB** (via `heed`): B-tree, MVCC, memory-mapped. Single-writer by
   design, matching the simplest concurrency model. Lock-free read transactions.
   Requires `EntryId` to produce fixed-size, sort-preserving bytes;
@@ -189,17 +244,18 @@ backend implements.
 
 ## Filesystem Backend
 
-The filesystem backend stores entries as markdown files. It targets
-single-user, human-readable scenarios where the store doubles as a
-browsable document tree. No concurrency support.
+The filesystem backend stores entry history as markdown files. It targets
+single-user scenarios where the history root remains inspectable. A separate
+working folder may provide the editable document tree. No concurrency support.
 
 ### Layout
 
-The user provides a root directory for the store.
-It must be empty on first use or contain a valid prior store state.
+The user provides a root directory for the history store.
+It must be empty on first use or contain a valid prior history state.
 
 ```
 <root>/
+  .eter-high-water
   <entry_id>/
     <version>-<entry_id>.md
     ...
@@ -216,9 +272,10 @@ lexicographic filename order matches version order. The `<entry_id>` suffix
 is redundant with the directory name but aids readability in editors and
 tools that display only the filename.
 
-The backend has no persistent global state on disk. It does not record a
-retired-version set. Retired and live versions must be tracked by the user
-and provided to garbage collection calls. Only derived caches are held in
+The backend persists only the allocation high-water mark as global metadata.
+It does not record a retired-version set. Retired versions are tracked in
+memory for the current backend instance, and callers may also provide an
+explicit live-version set to garbage collection. Derived caches are held in
 memory and rebuilt from the file tree on startup.
 
 ### File Format
@@ -237,19 +294,18 @@ Body text in markdown.
 
 The YAML mapping holds `lifecycle` and any user-defined fields registered with
 the backend. Registration is static: user-defined `Field` types are fixed at
-compile time and mapped to keys when the backend is constructed. A key set to
-`null` represents a deletion marker (`FieldRow::Deleted`) for that field. An
-absent key means the field is unchanged from the previous version and should
-be inherited during resolution.
+compile time and mapped to keys when the backend is constructed. A key's
+presence means the field has content in that full-entry snapshot. An absent key
+means the field is absent in that snapshot. Null values are invalid; deletion
+is encoded by omitting the key.
 
 Per-version metadata is complete across pathname and frontmatter:
 
 - Path metadata: `EntryId` from `<root>/<entry_id>/`.
 - Filename metadata: `version` from `<version>-<entry_id>.md`.
-- Frontmatter metadata: `lifecycle` and registered user fields, with `null`
-  encoding field deletion markers.
+- Frontmatter metadata: `lifecycle` and registered user fields.
 
-No additional hidden metadata exists for this backend.
+No additional per-entry hidden metadata exists for this backend.
 
 The markdown text after the closing delimiter is the entry's body, a
 privileged content field specific to this backend. It has no representation
@@ -258,30 +314,42 @@ in the YAML header.
 ### Protocol Mapping
 
 All fields for a given `(EntryId, version)` are co-located in a single file.
-This is per-entry storage: every write creates a new file containing all
-fields, copying unchanged values from the previous version. The trade-off
-is more storage on partial updates in exchange for simpler resolution,
-atomic per-entry snapshots, and human-readable files.
+This is full per-entry snapshot storage: every write creates a new file
+containing updated fields and unchanged fields copied from the previous
+version. The trade-off is more storage on partial updates in exchange for
+simpler resolution, atomic per-entry snapshots, and human-readable files.
 
 **resolve.** Scan filenames in `<root>/<entry_id>/`, find the file with the
 largest hex version ≤ the queried `Eterator`, parse the YAML header, and
 return the requested field. For the body field, return the markdown text.
 
-**write.** Assign the next version (one greater than the current maximum).
-Create a new file in `<root>/<entry_id>/` with the updated fields and all
-unchanged fields copied from the previous version.
+**write.** Assign the next version, one greater than `.eter-high-water`, then
+persist the new high-water mark. Create a new file in `<root>/<entry_id>/`
+with the updated fields and all unchanged fields copied from the previous
+version.
 
 **current_version.** The maximum hex version across all filenames in the
-root. Cached in memory after the initial scan and incremented on each
-write.
+root. Cached in memory after the initial scan, set to the committed version on
+write, and rebuilt after GC. This value may move backward after GC removes the
+newest retained snapshots.
+
+**high_water.** The largest version ever allocated by this backend. Stored in
+`<root>/.eter-high-water` as a 16-digit hexadecimal number. Rebuilt from
+filenames only when metadata is missing or lower than the file tree on open.
 
 **field_history.** List all files in `<root>/<entry_id>/` in version order
-and parse the requested field from each.
+and parse the requested field from each. Because files are full-entry
+snapshots, copied unchanged values may appear as later physical rows. When a
+field is present in one snapshot and absent in the next, the backend reports a
+logical `FieldRow::Deleted` at the later version.
 
-**gc.** Delete version files whose versions are retired and superseded by
-a later version for all live `Eterator`s. The backend does not persist the
-retired set; callers must provide live or retired versions explicitly for
-each collection run.
+**live_entries.** Scan entry directories and resolve `lifecycle` at the queried
+`Eterator`. This is O(entries) and is intended for application projection
+commit and checkout paths.
+
+**gc.** Delete version files whose served version ranges contain no live
+`Eterator`. The backend may use its in-memory retired set or an explicit live
+set supplied to the collection call.
 
 
 ## LMDB Backend
@@ -316,14 +384,17 @@ The environment contains:
 
 - One named database per registered `Field` type, identified by the field's
   static name string.
-- `_versions`: the version registry, recording every version ever committed.
+- `_versions`: the derived version registry, recording retained versions that
+  still have at least one field row.
+- `_high_water`: the allocation high-water mark.
 - `_retired`: the persistent retired-version set.
 
-The names `_versions` and `_retired` are reserved. A registered `Field` whose
-static name matches either will collide with a backend database at construction
-time; the backend rejects this at construction with a panic.
+The names `_versions`, `_high_water`, and `_retired` are reserved. A
+registered `Field` whose static name matches one of them will collide with a
+backend database at construction time; the backend rejects this at construction
+with a panic.
 
-The total database count is `|registered fields| + 2`. The backend derives
+The total database count is `|registered fields| + 3`. The backend derives
 `max_dbs` from the registered field list at construction time; the caller does
 not set it manually.
 
@@ -355,23 +426,24 @@ a single LMDB write transaction only at commit time. The alternative—holding
 the LMDB write transaction open from the moment `WriteTxn` is created—would
 block all GC passes and any operation that requires a write lock for the
 duration of accumulation. Buffering in memory and committing atomically avoids
-this hazard. On commit, all buffered field rows and a `_versions` entry are
-written in one atomic step.
+this hazard. On commit, all buffered field rows, a `_versions` entry, and the
+`_high_water` entry are written in one atomic step.
 
 ### Resolution
 
 Reading field `F` of entry `N` at `Eterator(V)`:
 
 1. Open a short-lived read transaction.
-2. Seek to the first key ≥ `N || V` using a lower-bound cursor seek.
-3. If the key equals `N || V` exactly, the row at version `V` exists; return
+2. Verify that `V` is present in `_versions`, unless `V` is `Eterator::EMPTY`.
+3. Seek to the first key ≥ `N || V` using a lower-bound cursor seek.
+4. If the key equals `N || V` exactly, the row at version `V` exists; return
    it directly.
-4. Otherwise step the cursor back one position.
-5. If the resulting key begins with the bytes of `N`, decode the version and
+5. Otherwise step the cursor back one position.
+6. If the resulting key begins with the bytes of `N`, decode the version and
    value from the key and the stored data. The resolution is complete.
-6. If the cursor is before the start of the database or the key prefix does
+7. If the cursor is before the start of the database or the key prefix does
    not equal the bytes of `N`, the field is absent for this entry.
-7. Close the read transaction.
+8. Close the read transaction.
 
 This is O(log n) in the total number of rows for field `F`, since the
 lower-bound seek is a single B-tree traversal. The current implementation
@@ -419,10 +491,11 @@ The backend constructor accepts two caller-supplied parameters.
 `map_size` sets the maximum size of the LMDB memory map in bytes. LMDB
 requires this value at environment open time and cannot grow the map
 automatically. If accumulated data exceeds `map_size`, subsequent writes
-return an error. Resizing requires calling `env.resize` with no active transactions of any
-kind (read or write); the caller is responsible for choosing a `map_size`
-large enough for the expected working set and for initiating resizes when
-needed. A safe default for small stores is 1 GiB; production deployments
+return an error. Resizing requires calling `env.resize` with no active
+transactions of any kind (read or write); the caller is responsible for
+choosing a `map_size` large enough for the expected working set and for
+initiating resizes when needed. A safe default for small stores is 1 GiB;
+production deployments
 should size this according to data volume projections.
 
 The registered field list is the second parameter. The backend enumerates it
@@ -434,9 +507,16 @@ No other persistent global configuration exists on disk.
 
 ### Version Registry
 
-The `_versions` database maps each committed version number (8-byte
-big-endian key) to an empty value. On each `WriteTxn::commit`, the new
-version is inserted into `_versions` within the same write transaction.
+The `_versions` database maps each retained version number (8-byte big-endian
+key) to an empty value. On each `WriteTxn::commit`, the new version is inserted
+into `_versions` within the same write transaction. During GC, a version with
+no remaining field rows is removed from `_versions`. The registry is therefore
+a derived index over the field databases.
+
+The `_high_water` database stores the largest version ever allocated by this
+backend. Commit writes `_versions`, `_high_water`, and field rows in one LMDB
+transaction. GC never decreases `_high_water`.
+
 `current_version` is a single backward cursor seek to the last key in
 `_versions`, executing in O(log n). `live_versions` scans `_versions` and
 subtracts `_retired`, both O(versions). `retired_versions` scans `_retired`,
@@ -453,8 +533,7 @@ databases (within the same write transaction, which sees the deletions) to
 determine which version numbers still have at least one row. Any version
 present in `_versions` but absent from the remaining rows is removed from
 both `_versions` and `_retired`. This bounds the growth of both auxiliary
-tables to the number of live versions, not the total number of versions ever
-written.
+tables to retained row versions, not the total number of versions ever written.
 
 Splitting GC into a read phase and a write phase is necessary because LMDB
 cursors used for scanning cannot coexist with mutations in the same table

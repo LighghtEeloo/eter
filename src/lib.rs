@@ -4,6 +4,10 @@
 //! entry store with immutable snapshots. Backends implement [`Eter`] to
 //! provide concrete storage.
 //!
+//! Applications may project snapshots into working folders, documents, or
+//! other editable forms. Those projections parse and render application syntax;
+//! the core protocol stores typed field updates.
+//!
 //! See `DESIGN.md` for the full design rationale.
 
 use std::collections::BTreeSet;
@@ -19,13 +23,17 @@ pub mod lmdb;
 
 /// Global version number identifying an immutable snapshot of the entry store.
 ///
-/// Each write produces a new `Eterator` strictly larger than any existing
-/// one. The version is derived as the maximum across all field rows in
-/// the store, not stored as a separate value.
+/// Each non-empty write produces a version greater than any version previously
+/// allocated by that backend. Backends keep an allocation high-water mark so
+/// collected version numbers are not reused.
 ///
 /// Only the store produces meaningful `Eterator` values. The inner field
 /// is public for serialization convenience, but constructing arbitrary
-/// values has no defined behavior unless the version exists in the store.
+/// values has no defined behavior unless the version is live in the store.
+///
+/// Note: a version that has been retired and collected is no longer a valid
+/// snapshot handle. Backends should reject reads through collected snapshots
+/// rather than resolving them against a different retained version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Eterator(pub u64);
 
@@ -129,24 +137,24 @@ pub type VersionedRow<T> = (Eterator, FieldRow<T>);
 
 /// Garbage-collection mode selection.
 ///
-/// This unifies persistent-state and stateless GC into one entrypoint.
+/// This unifies retired-set and stateless GC into one entrypoint.
 /// Backends choose the live-version set according to this option, then
 /// collect rows that are unreachable from that live set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GcOption {
-    /// Use the backend's persistent retired-version set.
+    /// Use the backend's retired-version set.
     ///
     /// Live versions are computed as "all store versions not retired."
     UseRetiredSet,
     /// Use an explicit live-version set for this call only.
     ///
-    /// Does not modify the backend's persistent retired-version set.
+    /// Does not modify the backend's retired-version set.
     UseLiveSet(BTreeSet<Eterator>),
 }
 
 /// Marker trait binding a field identity to its content type.
 ///
-/// Each field in an entry schema is a distinct zero-sized type implementing
+/// Each field in an entry facet is a distinct zero-sized type implementing
 /// `Field`. The store maintains a separate logical table per implementor,
 /// keyed by `(EntryId, version)`.
 ///
@@ -164,8 +172,8 @@ pub trait Field: 'static {
 /// The protocol checks this field to determine entry presence:
 /// [`Resolution::Content`] means the entry exists; any other resolution
 /// means it does not. The content type `L` is user-defined (e.g. a
-/// two-state active/removed enum, or richer states like archived or
-/// draft). The protocol only inspects presence, not the value.
+/// unit-like active marker, or richer states like archived or draft). The
+/// protocol only inspects presence, not the value.
 pub struct Lifecycle<L>(std::marker::PhantomData<L>);
 
 impl<L> Field for Lifecycle<L>
@@ -218,9 +226,10 @@ pub trait WriteTxn: Sized {
 /// [`WriteTxn`] transactions, and version management (retirement,
 /// garbage collection).
 ///
-/// The only persistent global state is the set of retired versions.
-/// All other cross-entry data, such as the current version and live-entry
-/// sets, is derived and cacheable.
+/// Entry content is defined by retained field history. Cross-entry data such
+/// as current version indices, version registries, allocation high-water marks,
+/// and live-entry sets is derived or auxiliary. Backends decide which derived
+/// indices are persisted.
 pub trait Eter {
     /// Entry identifier type, chosen by the user.
     /// Must be unique within the store.
@@ -243,6 +252,8 @@ pub trait Eter {
     ///
     /// Returns the row with the largest version ≤ `at` in the field's
     /// logical table for the given entry.
+    ///
+    /// Backends reject non-empty snapshot handles that are no longer retained.
     fn resolve<F: Field>(
         &self, at: Eterator, entry: &Self::EntryId,
     ) -> Result<Resolution<F::Content>, Self::Error>;
@@ -253,9 +264,14 @@ pub trait Eter {
     /// to [`Resolution::Content`] at `at`.
     fn entry_exists(&self, at: Eterator, entry: &Self::EntryId) -> Result<bool, Self::Error>;
 
-    /// The current version, derived as the maximum version across all
-    /// field rows. Returns [`Eterator::EMPTY`] for an empty store.
-    /// May be served from cache.
+    /// The current retained version.
+    ///
+    /// Returns [`Eterator::EMPTY`] for an empty store. May be served from
+    /// cache or from a backend-specific derived index.
+    ///
+    /// Note: this value may move backward after garbage collection removes the
+    /// newest retained versions. Future writes still use a backend high-water
+    /// mark and do not reuse collected version numbers.
     fn current_version(&self) -> Result<Eterator, Self::Error>;
 
     /// All rows ever written for a field on an entry, in version order.
@@ -271,7 +287,8 @@ pub trait Eter {
     ///
     /// Returns `true` if any field row exists for this id at any
     /// version, including entries that have since been deleted. Use this
-    /// to verify uniqueness before inserting a new entry.
+    /// to verify freshness before inserting a new entry. Reactivating a
+    /// deleted entry intentionally uses an id that is already in use.
     fn entry_id_in_use(&self, id: &Self::EntryId) -> Result<bool, Self::Error>;
 
     // -- Writes --
@@ -289,25 +306,31 @@ pub trait Eter {
     /// Add versions to the retired set, making their exclusive rows
     /// candidates for garbage collection.
     ///
+    /// Every supplied version must be retained by the store. The empty
+    /// sentinel is not a retained version.
+    ///
     /// Safe failure: if this write does not persist, the only consequence
     /// is that rows remain uncollected.
     fn retire(&mut self, versions: impl IntoIterator<Item = Eterator>) -> Result<(), Self::Error>;
 
-    /// Retire all versions except the given set.
+    /// Retire all versions except the given retained set.
+    ///
+    /// Every supplied version must be retained by the store. The empty
+    /// sentinel is not a retained version.
     fn only_keep(
         &mut self, versions: impl IntoIterator<Item = Eterator>,
     ) -> Result<(), Self::Error>;
 
     /// Run garbage collection with an explicit mode.
     ///
-    /// - [`GcOption::UseRetiredSet`] uses the backend's persistent
-    ///   retired-version state.
+    /// - [`GcOption::UseRetiredSet`] uses the backend's retired-version state.
     /// - [`GcOption::UseLiveSet`] uses a caller-provided live set for
     ///   this invocation only.
     ///
     /// In both modes, garbage collection frees rows unreachable from the
     /// selected live-version set and never alters reads through those live
-    /// versions.
+    /// versions. In [`GcOption::UseLiveSet`] mode, every supplied version must
+    /// be retained by the store.
     fn gc(&mut self, option: GcOption) -> Result<(), Self::Error>;
 
     /// The current retired-version set.
@@ -324,14 +347,67 @@ pub trait Eter {
     fn live_versions(&self) -> Result<BTreeSet<Eterator>, Self::Error>;
 }
 
-/// Optional trait for backends that cache the live-entry set.
+/// Optional trait for backends that can enumerate live entries.
 ///
-/// Without this, enumerating live entries requires scanning the full
-/// [`Eter::EntryId`] space and checking each entry's [`Lifecycle`] field.
+/// Backends may implement this with a cache, an index, or a direct scan over
+/// the lifecycle field. Without such support, callers must enumerate candidate
+/// [`Eter::EntryId`] values and check each entry's [`Lifecycle`] field.
 pub trait LiveEntries: Eter {
     /// All entry identifiers whose [`Lifecycle`] field resolves to content at `at`.
     fn live_entries(&self, at: Eterator) -> Result<BTreeSet<Self::EntryId>, Self::Error>;
 }
+
+/// Typed application-level facet of one entry for one store type.
+///
+/// A facet is a Rust type isomorphic to a coherent subset of an entry's fields.
+/// It may represent a complete lifecycle-bearing entry or a smaller view such
+/// as title metadata, scheduling fields, or application-specific state.
+///
+/// The facet owns required-field checks, defaulting rules, presence rules, and
+/// domain invariants for its field subset. Folder parsing and rendering still
+/// belong outside the core protocol.
+pub trait EntryFacet<S: Eter>: Sized {
+    /// Load this facet from `store` at `at` for entry `id`.
+    ///
+    /// Returns `Ok(None)` when the facet's presence rule is not satisfied. A
+    /// full-entry facet normally derives presence from [`Lifecycle`]; a partial
+    /// facet may use one required field, any required field set, or defaults.
+    /// Implementations should panic for facet-internal invariant violations.
+    fn load_from(store: &S, at: Eterator, id: &S::EntryId) -> Result<Option<Self>, S::Error>;
+
+    /// Apply this facet's field subset to `txn` for entry `id`.
+    ///
+    /// Implementations should write every field owned by the facet and leave
+    /// unrelated fields untouched.
+    fn apply_to<'a>(&self, txn: S::WriteTxn<'a>, id: &S::EntryId) -> S::WriteTxn<'a>
+    where
+        S: 'a;
+}
+
+/// Convenience methods for stores that use [`EntryFacet`] records.
+pub trait EntryFacetStoreExt: Eter {
+    /// Load a typed entry facet at `at`.
+    fn load_facet<F: EntryFacet<Self>>(
+        &self, at: Eterator, id: &Self::EntryId,
+    ) -> Result<Option<F>, Self::Error>
+    where
+        Self: Sized,
+    {
+        F::load_from(self, at, id)
+    }
+
+    /// Commit a typed entry facet as one write transaction.
+    fn write_facet<F: EntryFacet<Self>>(
+        &mut self, id: &Self::EntryId, facet: &F,
+    ) -> Result<Eterator, Self::Error>
+    where
+        Self: Sized,
+    {
+        facet.apply_to(self.write(), id).commit()
+    }
+}
+
+impl<T: Eter> EntryFacetStoreExt for T {}
 
 #[cfg(test)]
 mod tests {
