@@ -2,9 +2,12 @@
 //!
 //! Storage layout:
 //! - `<root>/<entry_id>/<version>-<entry_id>.md`
-//! - `<root>/.eter-gc-generation`
+//! - `<root>/Eter.lock.toml`
 //! - `version` is a 64-bit value encoded as 16 lowercase hex digits.
 //! - each file contains YAML frontmatter and a markdown body.
+//!
+//! `Eter.lock.toml` stores backend-global state such as the current GC
+//! generation.
 //!
 //! Frontmatter stores protocol fields by key. A key's presence means the field
 //! has content in that full-entry snapshot; omitting the key means the field is
@@ -12,7 +15,7 @@
 //! used for deletion rather than sparse inheritance.
 //!
 //! This backend stores one markdown file per `(EntryId, version)` snapshot. It
-//! keeps no persistent retired-version state on disk. Retired/live version
+//! keeps no persistent retired-snapshot state on disk. Retired/live snapshot
 //! bookkeeping is in memory and controlled by callers through [`crate::GcOption`].
 
 use std::any::TypeId;
@@ -32,9 +35,43 @@ use crate::{
     SnapshotRef, VersionedRow, WriteTxn,
 };
 
-const GC_GENERATION_FILENAME: &str = ".eter-gc-generation";
+const GLOBAL_STATE_FILENAME: &str = "Eter.lock.toml";
+const GLOBAL_STATE_FORMAT_VERSION: u32 = 1;
 
 type DecodedSnapshot = (Eterator, Map<String, Value>, String);
+
+/// Persistent global state for a filesystem store.
+///
+/// Stored as TOML at `<root>/Eter.lock.toml`.
+///
+/// Note: this file records store metadata; it is not a concurrency lock.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+struct FilesystemGlobalState {
+    /// Format version for the lock file schema.
+    lock_format_version: u32,
+    /// Current GC generation.
+    gc_generation: u64,
+}
+
+impl FilesystemGlobalState {
+    fn initial() -> Self {
+        Self::with_generation(GcGeneration::INITIAL)
+    }
+
+    fn with_generation(generation: GcGeneration) -> Self {
+        Self {
+            lock_format_version: GLOBAL_STATE_FORMAT_VERSION,
+            gc_generation: generation.number(),
+        }
+    }
+
+    fn generation(self) -> Result<GcGeneration, FilesystemError> {
+        if self.lock_format_version != GLOBAL_STATE_FORMAT_VERSION {
+            return Err(FilesystemError::UnsupportedLockFormat(self.lock_format_version));
+        }
+        Ok(GcGeneration(self.gc_generation))
+    }
+}
 
 /// Filesystem-native entry identifier.
 ///
@@ -58,7 +95,7 @@ impl FilesystemEntryId {
     }
 
     fn validate(entry: &str) -> Result<(), FilesystemError> {
-        if entry.is_empty() || entry == "." || entry == ".." {
+        if entry.is_empty() || entry == "." || entry == ".." || entry == GLOBAL_STATE_FILENAME {
             return Err(FilesystemError::InvalidEntryId(entry.to_owned()));
         }
         if entry.contains('/') || entry.contains('\0') {
@@ -153,7 +190,7 @@ impl FilesystemFieldRegistry {
 /// updated fields are written from the transaction and unchanged fields are
 /// copied from the latest earlier snapshot for that entry.
 ///
-/// Note: this backend keeps the retired-version set only in memory. Reopening a
+/// Note: this backend keeps the retired-snapshot set only in memory. Reopening a
 /// filesystem store starts with no retired snapshots.
 #[derive(Debug)]
 pub struct FilesystemBackend<L>
@@ -181,8 +218,8 @@ where
     /// The returned backend starts with an empty in-memory retired set, even
     /// when opening an existing store.
     ///
-    /// Note: opening an existing store may create `.eter-gc-generation` with
-    /// the initial generation if the metadata file is missing.
+    /// Note: opening an existing store may create `Eter.lock.toml` with the
+    /// initial generation if the metadata file is missing.
     ///
     /// Note: retired snapshots are not persisted by this backend. Callers own
     /// live/retired bookkeeping across process restarts.
@@ -209,11 +246,15 @@ where
         }
 
         let current = Self::scan_current_version(&root)?;
-        let stored_generation = Self::read_gc_generation(&root)?;
-        let generation = stored_generation.unwrap_or(GcGeneration::INITIAL);
-        if stored_generation != Some(generation) {
-            Self::persist_gc_generation_to(&root, generation)?;
-        }
+        let stored_state = Self::read_global_state(&root)?;
+        let generation = match stored_state {
+            | Some(state) => state.generation()?,
+            | None => {
+                let state = FilesystemGlobalState::initial();
+                Self::persist_global_state_to(&root, state)?;
+                state.generation()?
+            }
+        };
         trace!(
             "filesystem open end: current_version={} gc_generation={}",
             current.version(),
@@ -229,35 +270,33 @@ where
         })
     }
 
-    fn gc_generation_path(root: &Path) -> PathBuf {
-        root.join(GC_GENERATION_FILENAME)
+    fn global_state_path(root: &Path) -> PathBuf {
+        root.join(GLOBAL_STATE_FILENAME)
     }
 
-    fn read_gc_generation(root: &Path) -> Result<Option<GcGeneration>, FilesystemError> {
-        let path = Self::gc_generation_path(root);
+    fn read_global_state(root: &Path) -> Result<Option<FilesystemGlobalState>, FilesystemError> {
+        let path = Self::global_state_path(root);
         if !path.exists() {
             return Ok(None);
         }
         let text = fs::read_to_string(path)?;
-        let trimmed = text.trim();
-        if trimmed.len() != 16 {
-            return Err(FilesystemError::InvalidGcGeneration(text));
-        }
-        let generation = u64::from_str_radix(trimmed, 16)
-            .map_err(|_| FilesystemError::InvalidGcGeneration(text))?;
-        Ok(Some(GcGeneration(generation)))
+        let state = toml::from_str(&text)?;
+        Ok(Some(state))
     }
 
-    fn persist_gc_generation_to(
-        root: &Path, generation: GcGeneration,
+    fn persist_global_state_to(
+        root: &Path, state: FilesystemGlobalState,
     ) -> Result<(), FilesystemError> {
-        let path = Self::gc_generation_path(root);
-        fs::write(path, format!("{:016x}\n", generation.number()))?;
+        let path = Self::global_state_path(root);
+        fs::write(path, toml::to_string_pretty(&state)?)?;
         Ok(())
     }
 
-    fn persist_gc_generation(&self, generation: GcGeneration) -> Result<(), FilesystemError> {
-        Self::persist_gc_generation_to(&self.root, generation)
+    fn persist_global_state(&self, generation: GcGeneration) -> Result<(), FilesystemError> {
+        Self::persist_global_state_to(
+            &self.root,
+            FilesystemGlobalState::with_generation(generation),
+        )
     }
 
     fn next_version(&self) -> Eterator {
@@ -472,9 +511,9 @@ pub enum FilesystemError {
     /// Version filename does not match `<version>-<entry_id>.md`.
     #[error("invalid version filename: {0}")]
     InvalidFilename(String),
-    /// Persisted GC generation metadata is malformed.
-    #[error("invalid GC generation metadata: {0:?}")]
-    InvalidGcGeneration(String),
+    /// Filesystem lock file format version is unsupported.
+    #[error("unsupported filesystem lock format version: {0}")]
+    UnsupportedLockFormat(u32),
     /// The requested snapshot belongs to an older GC generation.
     #[error("stale snapshot generation: requested {requested:?}, current {current:?}")]
     StaleSnapshot {
@@ -501,6 +540,12 @@ pub enum FilesystemError {
     /// YAML frontmatter serialization or deserialization error.
     #[error("yaml error: {0}")]
     Yaml(#[from] serde_yaml::Error),
+    /// TOML lock file deserialization error.
+    #[error("toml decode error: {0}")]
+    TomlDecode(#[from] toml::de::Error),
+    /// TOML lock file serialization error.
+    #[error("toml encode error: {0}")]
+    TomlEncode(#[from] toml::ser::Error),
 }
 
 /// Write transaction for [`FilesystemBackend`].
@@ -800,7 +845,7 @@ where
         }
         if !delete_paths.is_empty() {
             let next_generation = self.generation.next();
-            self.persist_gc_generation(next_generation)?;
+            self.persist_global_state(next_generation)?;
             self.generation = next_generation;
             for path in delete_paths {
                 fs::remove_file(path)?;
@@ -1000,6 +1045,11 @@ mod tests {
     }
 
     #[test]
+    fn entry_id_rejects_global_state_filename() {
+        assert!(FilesystemEntryId::new("Eter.lock.toml").is_err());
+    }
+
+    #[test]
     fn entry_id_rejects_slash() {
         assert!(FilesystemEntryId::new("a/b").is_err());
     }
@@ -1184,12 +1234,54 @@ mod tests {
     }
 
     #[test]
+    fn open_creates_global_state_lock_file_if_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_path = temp.path().join("Eter.lock.toml");
+        assert!(!lock_path.exists());
+        let _store = open(temp.path());
+
+        let lock = std::fs::read_to_string(lock_path).unwrap();
+        assert!(lock.contains("lock_format_version = 1"));
+        assert!(lock.contains("gc_generation = 0"));
+    }
+
+    #[test]
     fn open_fails_when_root_is_a_file() {
         let temp = tempfile::tempdir().unwrap();
         let file_path = temp.path().join("not_a_dir");
         std::fs::write(&file_path, b"").unwrap();
         let registry = builtins_registry::<State>();
         assert!(FilesystemBackend::<State>::open(&file_path, registry).is_err());
+    }
+
+    #[test]
+    fn open_rejects_unsupported_global_state_format() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("Eter.lock.toml"),
+            "lock_format_version = 2\ngc_generation = 0\n",
+        )
+        .unwrap();
+        let registry = builtins_registry::<State>();
+        assert!(matches!(
+            FilesystemBackend::<State>::open(temp.path(), registry),
+            Err(FilesystemError::UnsupportedLockFormat(2))
+        ));
+    }
+
+    #[test]
+    fn open_rejects_invalid_global_state_lock_file() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("Eter.lock.toml"),
+            "lock_format_version = 1\ngc_generation = \"bad\"\n",
+        )
+        .unwrap();
+        let registry = builtins_registry::<State>();
+        assert!(matches!(
+            FilesystemBackend::<State>::open(temp.path(), registry),
+            Err(FilesystemError::TomlDecode(_))
+        ));
     }
 
     #[test]
@@ -1218,6 +1310,8 @@ mod tests {
         let v3 = reopened.write().set::<TagField>(&a, "new".to_owned()).commit().unwrap();
         assert_eq!(v3.eterator, v2.eterator);
         assert_ne!(v3.generation, v2.generation);
+        let lock = std::fs::read_to_string(temp.path().join("Eter.lock.toml")).unwrap();
+        assert!(lock.contains(&format!("gc_generation = {}", v3.generation.number())));
     }
 
     // -- write / resolve / current_version --

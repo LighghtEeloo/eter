@@ -262,7 +262,7 @@ It must be empty on first use or contain a valid prior history state.
 
 ```
 <root>/
-  .eter-gc-generation
+  Eter.lock.toml
   <entry_id>/
     <version>-<entry_id>.md
     ...
@@ -270,8 +270,9 @@ It must be empty on first use or contain a valid prior history state.
 ```
 
 Each entry occupies a subdirectory named by its `EntryId`, which must be
-filesystem-friendly: no path separators, no `.` or `..`, no null bytes,
-and reasonable length. Inside are markdown files, one per version.
+filesystem-friendly: no path separators, no `.` or `..`, no null bytes, no
+`Eter.lock.toml`, and reasonable length. Inside are markdown files, one per
+version.
 
 The filename is `<version>-<entry_id>.md` where `<version>` is the 64-bit
 version number zero-padded to 16 hexadecimal digits. Zero-padding ensures
@@ -279,11 +280,17 @@ lexicographic filename order matches version order. The `<entry_id>` suffix
 is redundant with the directory name but aids readability in editors and
 tools that display only the filename.
 
-The backend persists only the GC generation as global metadata. It does not
-record a retired-snapshot set. Retired snapshots are tracked in memory for the
-current backend instance, and callers may also provide an explicit live set to
-garbage collection. Derived caches are held in memory and rebuilt from the file
-tree on startup.
+The backend persists global metadata in `Eter.lock.toml`. The file stores the
+lock-file format version and the current GC generation. It does not record a
+retired-snapshot set. Retired snapshots are tracked in memory for the current
+backend instance, and callers may also provide an explicit live set to garbage
+collection. Derived caches are held in memory and rebuilt from the file tree on
+startup.
+
+```toml
+lock_format_version = 1
+gc_generation = 0
+```
 
 ### File Format
 
@@ -341,9 +348,9 @@ root. Cached in memory after the initial scan, set to the committed version on
 write, and rebuilt after GC. This value may move backward after GC removes the
 newest retained snapshots.
 
-**gc_generation.** The current GC generation. Stored in
-`<root>/.eter-gc-generation` as a 16-digit hexadecimal number. Created with the
-initial generation when missing on open.
+**gc_generation.** The current GC generation. Stored in `Eter.lock.toml` as an
+unsigned TOML integer. Created with the initial generation when missing on
+open.
 
 **field_history.** List all files in `<root>/<entry_id>/` in version order
 and parse the requested field from each. Because files are full-entry
