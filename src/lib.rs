@@ -21,19 +21,18 @@ pub mod filesystem;
 #[cfg(feature = "lmdb")]
 pub mod lmdb;
 
-/// Global version number identifying an immutable snapshot of the entry store.
+/// Reusable version coordinate inside one GC generation.
 ///
-/// Each non-empty write produces a version greater than any version previously
-/// allocated by that backend. Backends keep an allocation high-water mark so
-/// collected version numbers are not reused.
+/// Each non-empty write produces the next version after the current retained
+/// version. Garbage collection may remove newer retained versions, after which
+/// later writes may reuse their numeric coordinates.
 ///
 /// Only the store produces meaningful `Eterator` values. The inner field
 /// is public for serialization convenience, but constructing arbitrary
-/// values has no defined behavior unless the version is live in the store.
+/// values has no defined behavior unless paired with the store's current
+/// [`GcGeneration`] in a [`SnapshotRef`].
 ///
-/// Note: a version that has been retired and collected is no longer a valid
-/// snapshot handle. Backends should reject reads through collected snapshots
-/// rather than resolving them against a different retained version.
+/// Note: an `Eterator` by itself is not a stable snapshot identity across GC.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Eterator(pub u64);
 
@@ -47,11 +46,66 @@ impl Eterator {
     }
 }
 
-/// Result of resolving a field at a given [`Eterator`].
+/// Generation of the retained version coordinate space.
+///
+/// Backends increment this value when garbage collection physically removes
+/// snapshot data. The generation lets callers detect that an old
+/// [`Eterator`] may now refer to different content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GcGeneration(pub u64);
+
+impl GcGeneration {
+    /// Initial generation for a new store.
+    pub const INITIAL: Self = Self(0);
+
+    /// The raw generation number.
+    pub fn number(self) -> u64 {
+        self.0
+    }
+
+    /// The next generation.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the generation number space is exhausted.
+    pub fn next(self) -> Self {
+        Self(self.0.checked_add(1).unwrap_or_else(|| panic!("GC generation space exhausted")))
+    }
+}
+
+/// Stable reference to a snapshot within a store generation.
+///
+/// `eterator` may be reused after garbage collection. The pair
+/// `(generation, eterator)` is the value callers should keep when they need to
+/// recognize stale references.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SnapshotRef {
+    /// GC generation in which `eterator` was observed.
+    pub generation: GcGeneration,
+    /// Version coordinate inside `generation`.
+    pub eterator: Eterator,
+}
+
+impl SnapshotRef {
+    /// Construct a snapshot reference from a generation and version coordinate.
+    pub fn new(generation: GcGeneration, eterator: Eterator) -> Self {
+        Self { generation, eterator }
+    }
+
+    /// Snapshot reference for an empty store in the initial generation.
+    pub const EMPTY: Self = Self { generation: GcGeneration::INITIAL, eterator: Eterator::EMPTY };
+
+    /// The raw version number inside the generation.
+    pub fn version(self) -> u64 {
+        self.eterator.version()
+    }
+}
+
+/// Result of resolving a field at a given [`SnapshotRef`].
 ///
 /// Three outcomes per the resolution algorithm:
 /// - [`Content`](Resolution::Content): the row with the largest version
-///   ≤ the queried `Eterator` holds a value.
+///   ≤ the queried snapshot's `Eterator` holds a value.
 /// - [`Deleted`](Resolution::Deleted): that row is a deletion marker.
 /// - [`Absent`](Resolution::Absent): no row exists for this
 ///   `(EntryId, field)` pair at or before the queried version.
@@ -131,25 +185,25 @@ impl<T> From<FieldRow<T>> for Resolution<T> {
     }
 }
 
-/// A versioned field row: the [`Eterator`] at which the row was written
+/// A versioned field row: the [`SnapshotRef`] at which the row was written
 /// paired with its [`FieldRow`] content.
-pub type VersionedRow<T> = (Eterator, FieldRow<T>);
+pub type VersionedRow<T> = (SnapshotRef, FieldRow<T>);
 
 /// Garbage-collection mode selection.
 ///
 /// This unifies retired-set and stateless GC into one entrypoint.
-/// Backends choose the live-version set according to this option, then
+/// Backends choose the live-snapshot set according to this option, then
 /// collect rows that are unreachable from that live set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GcOption {
-    /// Use the backend's retired-version set.
+    /// Use the backend's retired-snapshot set.
     ///
-    /// Live versions are computed as "all store versions not retired."
+    /// Live snapshots are computed as "all store snapshots not retired."
     UseRetiredSet,
-    /// Use an explicit live-version set for this call only.
+    /// Use an explicit live-snapshot set for this call only.
     ///
-    /// Does not modify the backend's retired-version set.
-    UseLiveSet(BTreeSet<Eterator>),
+    /// Does not modify the backend's retired-snapshot set.
+    UseLiveSet(BTreeSet<SnapshotRef>),
 }
 
 /// Marker trait binding a field identity to its content type.
@@ -187,7 +241,7 @@ where
 ///
 /// All rows produced by one transaction share the same version number.
 /// Setters consume and return `self` for chaining; [`WriteTxn::commit`]
-/// finalizes the transaction and produces the new [`Eterator`].
+/// finalizes the transaction and produces the new [`SnapshotRef`].
 ///
 /// ```ignore
 /// store.write()
@@ -216,18 +270,18 @@ pub trait WriteTxn: Sized {
         self.apply::<F>(entry, FieldRow::Deleted)
     }
 
-    /// Commit all accumulated writes, producing a new snapshot.
-    fn commit(self) -> Result<Eterator, Self::Error>;
+    /// Commit all accumulated writes, producing a new snapshot reference.
+    fn commit(self) -> Result<SnapshotRef, Self::Error>;
 }
 
 /// The store.
 ///
-/// Provides snapshot reads via [`Eterator`] handles, writes via
+/// Provides snapshot reads via [`SnapshotRef`] handles, writes via
 /// [`WriteTxn`] transactions, and version management (retirement,
 /// garbage collection).
 ///
 /// Entry content is defined by retained field history. Cross-entry data such
-/// as current version indices, version registries, allocation high-water marks,
+/// as current version indices, version registries, GC generation, retired sets,
 /// and live-entry sets is derived or auxiliary. Backends decide which derived
 /// indices are persisted.
 pub trait Eter {
@@ -248,35 +302,49 @@ pub trait Eter {
 
     // -- Reads --
 
-    /// Resolve a field for an entry at a given snapshot.
+    /// Resolve a field for an entry at a given snapshot reference.
     ///
-    /// Returns the row with the largest version ≤ `at` in the field's
+    /// Returns the row with the largest version ≤ `at.eterator` in the field's
     /// logical table for the given entry.
     ///
-    /// Backends reject non-empty snapshot handles that are no longer retained.
+    /// Backends reject snapshot references from older GC generations and
+    /// non-empty version coordinates that are not retained in the current
+    /// generation.
     fn resolve<F: Field>(
-        &self, at: Eterator, entry: &Self::EntryId,
+        &self, at: SnapshotRef, entry: &Self::EntryId,
     ) -> Result<Resolution<F::Content>, Self::Error>;
 
     /// Check whether an entry exists at a given snapshot.
     ///
     /// Equivalent to checking whether the [`Lifecycle`] field resolves
     /// to [`Resolution::Content`] at `at`.
-    fn entry_exists(&self, at: Eterator, entry: &Self::EntryId) -> Result<bool, Self::Error>;
+    fn entry_exists(&self, at: SnapshotRef, entry: &Self::EntryId) -> Result<bool, Self::Error>;
+
+    /// Current GC generation.
+    fn gc_generation(&self) -> Result<GcGeneration, Self::Error>;
+
+    /// The current retained snapshot reference.
+    ///
+    /// Returns the current generation paired with [`Eterator::EMPTY`] for an
+    /// empty store. May be served from cache or from a backend-specific derived
+    /// index.
+    fn current_snapshot(&self) -> Result<SnapshotRef, Self::Error>;
 
     /// The current retained version.
     ///
     /// Returns [`Eterator::EMPTY`] for an empty store. May be served from
     /// cache or from a backend-specific derived index.
     ///
-    /// Note: this value may move backward after garbage collection removes the
-    /// newest retained versions. Future writes still use a backend high-water
-    /// mark and do not reuse collected version numbers.
-    fn current_version(&self) -> Result<Eterator, Self::Error>;
+    /// Note: this value may move backward after garbage collection removes
+    /// newer retained versions, and later writes may reuse removed numeric
+    /// coordinates in the new GC generation.
+    fn current_version(&self) -> Result<Eterator, Self::Error> {
+        Ok(self.current_snapshot()?.eterator)
+    }
 
     /// All rows ever written for a field on an entry, in version order.
     ///
-    /// Returns `(Eterator, FieldRow)` pairs spanning the full history
+    /// Returns `(SnapshotRef, FieldRow)` pairs spanning the full history
     /// of this `(EntryId, field)`. Useful for auditing, diffing, and
     /// building undo interfaces.
     fn field_history<F: Field>(
@@ -297,54 +365,58 @@ pub trait Eter {
     ///
     /// The returned [`WriteTxn`] accumulates field updates. Calling
     /// [`WriteTxn::commit`] assigns a new version to all accumulated
-    /// rows and returns the corresponding [`Eterator`].
+    /// rows and returns the corresponding [`SnapshotRef`].
     #[must_use = "a write transaction does nothing until committed"]
     fn write(&mut self) -> Self::WriteTxn<'_>;
 
     // -- Version management --
 
-    /// Add versions to the retired set, making their exclusive rows
+    /// Add snapshots to the retired set, making their exclusive rows
     /// candidates for garbage collection.
     ///
-    /// Every supplied version must be retained by the store. The empty
+    /// Every supplied snapshot must be retained by the store. The empty
     /// sentinel is not a retained version.
     ///
     /// Safe failure: if this write does not persist, the only consequence
     /// is that rows remain uncollected.
-    fn retire(&mut self, versions: impl IntoIterator<Item = Eterator>) -> Result<(), Self::Error>;
+    fn retire(
+        &mut self, snapshots: impl IntoIterator<Item = SnapshotRef>,
+    ) -> Result<(), Self::Error>;
 
-    /// Retire all versions except the given retained set.
+    /// Retire all snapshots except the given retained set.
     ///
-    /// Every supplied version must be retained by the store. The empty
+    /// Every supplied snapshot must be retained by the store. The empty
     /// sentinel is not a retained version.
     fn only_keep(
-        &mut self, versions: impl IntoIterator<Item = Eterator>,
+        &mut self, snapshots: impl IntoIterator<Item = SnapshotRef>,
     ) -> Result<(), Self::Error>;
 
     /// Run garbage collection with an explicit mode.
     ///
-    /// - [`GcOption::UseRetiredSet`] uses the backend's retired-version state.
+    /// - [`GcOption::UseRetiredSet`] uses the backend's retired-snapshot state.
     /// - [`GcOption::UseLiveSet`] uses a caller-provided live set for
     ///   this invocation only.
     ///
     /// In both modes, garbage collection frees rows unreachable from the
-    /// selected live-version set and never alters reads through those live
-    /// versions. In [`GcOption::UseLiveSet`] mode, every supplied version must
-    /// be retained by the store.
+    /// selected live-snapshot set. When rows are physically removed, backends
+    /// advance the GC generation and reject snapshot references from older
+    /// generations. In [`GcOption::UseLiveSet`] mode, every supplied snapshot
+    /// must be retained by the store.
     fn gc(&mut self, option: GcOption) -> Result<(), Self::Error>;
 
-    /// The current retired-version set.
+    /// The current retired-snapshot set.
     ///
-    /// Every version in this set is a candidate for garbage collection.
-    /// Versions not in this set are considered live and must be preserved.
-    fn retired_versions(&self) -> Result<BTreeSet<Eterator>, Self::Error>;
+    /// Every snapshot in this set is a candidate for garbage collection.
+    /// Retained snapshots not in this set are considered live and must be
+    /// preserved.
+    fn retired_snapshots(&self) -> Result<BTreeSet<SnapshotRef>, Self::Error>;
 
-    /// All live (non-retired) versions in the store.
+    /// All live (non-retired) snapshots in the store.
     ///
-    /// These are the versions for which reads are guaranteed to be
-    /// stable. Useful for deciding which versions to pass to
+    /// These snapshots belong to the current GC generation and are useful for
+    /// deciding which snapshots to pass to
     /// [`Eter::only_keep`] or [`Eter::retire`].
-    fn live_versions(&self) -> Result<BTreeSet<Eterator>, Self::Error>;
+    fn live_snapshots(&self) -> Result<BTreeSet<SnapshotRef>, Self::Error>;
 }
 
 /// Optional trait for backends that can enumerate live entries.
@@ -354,7 +426,7 @@ pub trait Eter {
 /// [`Eter::EntryId`] values and check each entry's [`Lifecycle`] field.
 pub trait LiveEntries: Eter {
     /// All entry identifiers whose [`Lifecycle`] field resolves to content at `at`.
-    fn live_entries(&self, at: Eterator) -> Result<BTreeSet<Self::EntryId>, Self::Error>;
+    fn live_entries(&self, at: SnapshotRef) -> Result<BTreeSet<Self::EntryId>, Self::Error>;
 }
 
 /// Typed application-level facet of one entry for one store type.
@@ -373,7 +445,7 @@ pub trait EntryFacet<S: Eter>: Sized {
     /// full-entry facet normally derives presence from [`Lifecycle`]; a partial
     /// facet may use one required field, any required field set, or defaults.
     /// Implementations should panic for facet-internal invariant violations.
-    fn load_from(store: &S, at: Eterator, id: &S::EntryId) -> Result<Option<Self>, S::Error>;
+    fn load_from(store: &S, at: SnapshotRef, id: &S::EntryId) -> Result<Option<Self>, S::Error>;
 
     /// Apply this facet's field subset to `txn` for entry `id`.
     ///
@@ -388,7 +460,7 @@ pub trait EntryFacet<S: Eter>: Sized {
 pub trait EntryFacetStoreExt: Eter {
     /// Load a typed entry facet at `at`.
     fn load_facet<F: EntryFacet<Self>>(
-        &self, at: Eterator, id: &Self::EntryId,
+        &self, at: SnapshotRef, id: &Self::EntryId,
     ) -> Result<Option<F>, Self::Error>
     where
         Self: Sized,
@@ -399,7 +471,7 @@ pub trait EntryFacetStoreExt: Eter {
     /// Commit a typed entry facet as one write transaction.
     fn write_facet<F: EntryFacet<Self>>(
         &mut self, id: &Self::EntryId, facet: &F,
-    ) -> Result<Eterator, Self::Error>
+    ) -> Result<SnapshotRef, Self::Error>
     where
         Self: Sized,
     {

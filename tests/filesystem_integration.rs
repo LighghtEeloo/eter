@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
 
 use eter::filesystem::{FilesystemBackend, FilesystemEntryId, builtins_registry};
-use eter::{Eter, Eterator, Field, FieldRow, GcOption, Lifecycle, Resolution, WriteTxn};
+use eter::{
+    Eter, Eterator, Field, FieldRow, GcOption, Lifecycle, Resolution, SnapshotRef, WriteTxn,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +83,7 @@ fn filesystem_backend_supports_static_user_defined_fields() -> Result<(), Box<dy
     );
 
     store.gc(GcOption::UseLiveSet(BTreeSet::from([v3])))?;
+    let v3 = SnapshotRef::new(store.gc_generation()?, v3.eterator);
     assert_eq!(store.field_history::<PriorityField>(&alpha)?, vec![(v3, FieldRow::Content(2))]);
     assert!(store.entry_exists(v3, &beta)?);
     assert_eq!(store.resolve::<TitleField>(v3, &beta)?, Resolution::Content("Beta".to_owned()));
@@ -259,16 +262,17 @@ fn retire_and_gc_with_retired_set() -> Result<(), Box<dyn std::error::Error>> {
         .set::<PriorityField>(&alpha, 10)
         .commit()?;
     let v2 = store.write().set::<PriorityField>(&alpha, 20).commit()?;
-    let v3 = store.write().set::<PriorityField>(&alpha, 30).commit()?;
+    let _v3 = store.write().set::<PriorityField>(&alpha, 30).commit()?;
 
     store.retire([v1, v2])?;
-    assert_eq!(store.retired_versions()?, BTreeSet::from([v1, v2]));
+    assert_eq!(store.retired_snapshots()?, BTreeSet::from([v1, v2]));
 
     store.gc(GcOption::UseRetiredSet)?;
+    let v3 = store.current_snapshot()?;
 
     // Only v3 is live; v1 and v2 history is gone.
     assert_eq!(store.field_history::<PriorityField>(&alpha)?, vec![(v3, FieldRow::Content(30))]);
-    assert_eq!(store.current_version()?, v3);
+    assert_eq!(store.current_version()?, v3.eterator);
     Ok(())
 }
 
@@ -288,21 +292,22 @@ fn only_keep_retires_all_except_specified() -> Result<(), Box<dyn std::error::Er
 
     store.only_keep([v3])?;
     // v1 and v2 should be retired; v3 should not be.
-    let retired = store.retired_versions()?;
+    let retired = store.retired_snapshots()?;
     assert!(retired.contains(&v1));
     assert!(retired.contains(&v2));
     assert!(!retired.contains(&v3));
 
-    let live = store.live_versions()?;
+    let live = store.live_snapshots()?;
     assert_eq!(live, BTreeSet::from([v3]));
 
     store.gc(GcOption::UseRetiredSet)?;
+    let v3 = store.current_snapshot()?;
     assert_eq!(store.field_history::<PriorityField>(&alpha)?, vec![(v3, FieldRow::Content(3))]);
     Ok(())
 }
 
 #[test]
-fn live_versions_excludes_retired() -> Result<(), Box<dyn std::error::Error>> {
+fn live_snapshots_excludes_retired() -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempfile::tempdir()?;
     let mut store = open_store(temp.path())?;
 
@@ -310,10 +315,10 @@ fn live_versions_excludes_retired() -> Result<(), Box<dyn std::error::Error>> {
     let v1 = store.write().set::<Lifecycle<LifeState>>(&alpha, LifeState::Active).commit()?;
     let v2 = store.write().set::<TitleField>(&alpha, "hello".to_owned()).commit()?;
 
-    assert_eq!(store.live_versions()?, BTreeSet::from([v1, v2]));
+    assert_eq!(store.live_snapshots()?, BTreeSet::from([v1, v2]));
 
     store.retire([v1])?;
-    assert_eq!(store.live_versions()?, BTreeSet::from([v2]));
+    assert_eq!(store.live_snapshots()?, BTreeSet::from([v2]));
     Ok(())
 }
 
@@ -334,7 +339,7 @@ fn reopen_store_recovers_current_version() -> Result<(), Box<dyn std::error::Err
 
     // Re-open the same directory.
     let store2 = open_store(temp.path())?;
-    assert_eq!(store2.current_version()?, v_final);
+    assert_eq!(store2.current_version()?, v_final.eterator);
 
     let alpha = FilesystemEntryId::new("alpha")?;
     assert_eq!(
@@ -345,7 +350,7 @@ fn reopen_store_recovers_current_version() -> Result<(), Box<dyn std::error::Err
 }
 
 #[test]
-fn gc_preserves_reads_through_live_versions() -> Result<(), Box<dyn std::error::Error>> {
+fn gc_preserves_reads_through_live_snapshots() -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempfile::tempdir()?;
     let mut store = open_store(temp.path())?;
 
@@ -361,10 +366,13 @@ fn gc_preserves_reads_through_live_versions() -> Result<(), Box<dyn std::error::
 
     // Keep v1 and v3; GC should drop what it can without breaking reads.
     store.gc(GcOption::UseLiveSet(BTreeSet::from([v1, v3])))?;
+    let generation = store.gc_generation()?;
+    let v1 = SnapshotRef::new(generation, v1.eterator);
+    let v3 = SnapshotRef::new(generation, v3.eterator);
 
     assert_eq!(store.resolve::<PriorityField>(v1, &alpha)?, Resolution::Content(1));
     assert_eq!(store.resolve::<PriorityField>(v3, &alpha)?, Resolution::Content(3));
-    // v2 was between two live versions and not live itself; it may have been dropped.
+    // v2 was between two live snapshots and not live itself; it may have been dropped.
     // But reads at v1 and v3 must still be correct.
     let hist = store.field_history::<PriorityField>(&alpha)?;
     assert!(hist.iter().any(|(v, r)| *v == v1 && *r == FieldRow::Content(1)));

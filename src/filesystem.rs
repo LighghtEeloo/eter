@@ -2,7 +2,7 @@
 //!
 //! Storage layout:
 //! - `<root>/<entry_id>/<version>-<entry_id>.md`
-//! - `<root>/.eter-high-water`
+//! - `<root>/.eter-gc-generation`
 //! - `version` is a 64-bit value encoded as 16 lowercase hex digits.
 //! - each file contains YAML frontmatter and a markdown body.
 //!
@@ -28,11 +28,11 @@ use thiserror::Error;
 use tracing::trace;
 
 use crate::{
-    Eter, Eterator, Field, FieldRow, GcOption, Lifecycle, LiveEntries, Resolution, VersionedRow,
-    WriteTxn,
+    Eter, Eterator, Field, FieldRow, GcGeneration, GcOption, Lifecycle, LiveEntries, Resolution,
+    SnapshotRef, VersionedRow, WriteTxn,
 };
 
-const HIGH_WATER_FILENAME: &str = ".eter-high-water";
+const GC_GENERATION_FILENAME: &str = ".eter-gc-generation";
 
 type DecodedSnapshot = (Eterator, Map<String, Value>, String);
 
@@ -154,7 +154,7 @@ impl FilesystemFieldRegistry {
 /// copied from the latest earlier snapshot for that entry.
 ///
 /// Note: this backend keeps the retired-version set only in memory. Reopening a
-/// filesystem store starts with no retired versions.
+/// filesystem store starts with no retired snapshots.
 #[derive(Debug)]
 pub struct FilesystemBackend<L>
 where
@@ -164,7 +164,7 @@ where
     fields: FilesystemFieldRegistry,
     retired: BTreeSet<Eterator>,
     current: Eterator,
-    high_water: Eterator,
+    generation: GcGeneration,
     _lifecycle: std::marker::PhantomData<L>,
 }
 
@@ -181,10 +181,10 @@ where
     /// The returned backend starts with an empty in-memory retired set, even
     /// when opening an existing store.
     ///
-    /// Note: opening an existing store may create or repair `.eter-high-water`
-    /// so future writes do not reuse a collected version number.
+    /// Note: opening an existing store may create `.eter-gc-generation` with
+    /// the initial generation if the metadata file is missing.
     ///
-    /// Note: retired versions are not persisted by this backend. Callers own
+    /// Note: retired snapshots are not persisted by this backend. Callers own
     /// live/retired bookkeeping across process restarts.
     ///
     /// # Panics
@@ -209,58 +209,60 @@ where
         }
 
         let current = Self::scan_current_version(&root)?;
-        let stored_high_water = Self::read_high_water(&root)?;
-        let high_water = stored_high_water.unwrap_or(current).max(current);
-        if stored_high_water != Some(high_water) {
-            Self::persist_high_water_to(&root, high_water)?;
+        let stored_generation = Self::read_gc_generation(&root)?;
+        let generation = stored_generation.unwrap_or(GcGeneration::INITIAL);
+        if stored_generation != Some(generation) {
+            Self::persist_gc_generation_to(&root, generation)?;
         }
         trace!(
-            "filesystem open end: current_version={} high_water={}",
+            "filesystem open end: current_version={} gc_generation={}",
             current.version(),
-            high_water.version()
+            generation.number()
         );
         Ok(Self {
             root,
             fields,
             retired: BTreeSet::new(),
             current,
-            high_water,
+            generation,
             _lifecycle: std::marker::PhantomData,
         })
     }
 
-    fn high_water_path(root: &Path) -> PathBuf {
-        root.join(HIGH_WATER_FILENAME)
+    fn gc_generation_path(root: &Path) -> PathBuf {
+        root.join(GC_GENERATION_FILENAME)
     }
 
-    fn read_high_water(root: &Path) -> Result<Option<Eterator>, FilesystemError> {
-        let path = Self::high_water_path(root);
+    fn read_gc_generation(root: &Path) -> Result<Option<GcGeneration>, FilesystemError> {
+        let path = Self::gc_generation_path(root);
         if !path.exists() {
             return Ok(None);
         }
         let text = fs::read_to_string(path)?;
         let trimmed = text.trim();
         if trimmed.len() != 16 {
-            return Err(FilesystemError::InvalidHighWater(text));
+            return Err(FilesystemError::InvalidGcGeneration(text));
         }
-        let version = u64::from_str_radix(trimmed, 16)
-            .map_err(|_| FilesystemError::InvalidHighWater(text))?;
-        Ok(Some(Eterator(version)))
+        let generation = u64::from_str_radix(trimmed, 16)
+            .map_err(|_| FilesystemError::InvalidGcGeneration(text))?;
+        Ok(Some(GcGeneration(generation)))
     }
 
-    fn persist_high_water_to(root: &Path, version: Eterator) -> Result<(), FilesystemError> {
-        let path = Self::high_water_path(root);
-        fs::write(path, format!("{:016x}\n", version.version()))?;
+    fn persist_gc_generation_to(
+        root: &Path, generation: GcGeneration,
+    ) -> Result<(), FilesystemError> {
+        let path = Self::gc_generation_path(root);
+        fs::write(path, format!("{:016x}\n", generation.number()))?;
         Ok(())
     }
 
-    fn persist_high_water(&self, version: Eterator) -> Result<(), FilesystemError> {
-        Self::persist_high_water_to(&self.root, version)
+    fn persist_gc_generation(&self, generation: GcGeneration) -> Result<(), FilesystemError> {
+        Self::persist_gc_generation_to(&self.root, generation)
     }
 
     fn next_version(&self) -> Eterator {
         Eterator(
-            self.high_water
+            self.current
                 .version()
                 .checked_add(1)
                 .unwrap_or_else(|| panic!("filesystem version space exhausted")),
@@ -409,11 +411,21 @@ where
         Ok(versions)
     }
 
-    fn ensure_retained_snapshot(&self, at: Eterator) -> Result<(), FilesystemError> {
-        if at == Eterator::EMPTY {
+    fn current_snapshot_ref(&self) -> SnapshotRef {
+        SnapshotRef::new(self.generation, self.current)
+    }
+
+    fn ensure_retained_snapshot(&self, at: SnapshotRef) -> Result<(), FilesystemError> {
+        if at.generation != self.generation {
+            return Err(FilesystemError::StaleSnapshot {
+                requested: at.generation,
+                current: self.generation,
+            });
+        }
+        if at.eterator == Eterator::EMPTY {
             return Ok(());
         }
-        if self.all_versions()?.contains(&at) {
+        if self.all_versions()?.contains(&at.eterator) {
             Ok(())
         } else {
             Err(FilesystemError::InvalidSnapshot(at))
@@ -432,12 +444,12 @@ where
     /// than or equal to `at`. Unlike frontmatter fields, the body has no
     /// deletion marker; an existing snapshot always resolves to content.
     pub fn resolve_body(
-        &self, at: Eterator, entry: &FilesystemEntryId,
+        &self, at: SnapshotRef, entry: &FilesystemEntryId,
     ) -> Result<Resolution<String>, FilesystemError> {
         trace!("filesystem resolve_body begin: at={} entry={entry}", at.version());
         FilesystemEntryId::validate(entry.as_str())?;
         self.ensure_retained_snapshot(at)?;
-        let result = match self.latest_snapshot_at(entry, at)? {
+        let result = match self.latest_snapshot_at(entry, at.eterator)? {
             | Some((_, _, body)) => Resolution::Content(body),
             | None => Resolution::Absent,
         };
@@ -460,12 +472,20 @@ pub enum FilesystemError {
     /// Version filename does not match `<version>-<entry_id>.md`.
     #[error("invalid version filename: {0}")]
     InvalidFilename(String),
-    /// Persisted high-water version metadata is malformed.
-    #[error("invalid high-water version metadata: {0:?}")]
-    InvalidHighWater(String),
+    /// Persisted GC generation metadata is malformed.
+    #[error("invalid GC generation metadata: {0:?}")]
+    InvalidGcGeneration(String),
+    /// The requested snapshot belongs to an older GC generation.
+    #[error("stale snapshot generation: requested {requested:?}, current {current:?}")]
+    StaleSnapshot {
+        /// Generation on the supplied snapshot reference.
+        requested: GcGeneration,
+        /// Current store generation.
+        current: GcGeneration,
+    },
     /// The requested snapshot is no longer retained by the store.
     #[error("invalid or collected snapshot version: {0:?}")]
-    InvalidSnapshot(Eterator),
+    InvalidSnapshot(SnapshotRef),
     /// Markdown frontmatter is malformed.
     #[error("invalid frontmatter format")]
     InvalidFrontmatter,
@@ -552,16 +572,14 @@ where
         self
     }
 
-    fn commit(self) -> Result<Eterator, Self::Error> {
+    fn commit(self) -> Result<SnapshotRef, Self::Error> {
         trace!("filesystem commit begin: entries={}", self.pending.len());
         if self.pending.is_empty() {
             trace!("filesystem commit end: no-op");
-            return Ok(self.store.current);
+            return Ok(self.store.current_snapshot_ref());
         }
 
         let next = self.store.next_version();
-        self.store.persist_high_water(next)?;
-        self.store.high_water = next;
         for (entry, updates) in self.pending {
             let previous = self.store.latest_snapshot_at(&entry, self.store.current)?;
             let (mut header, body) = match previous {
@@ -583,7 +601,7 @@ where
         }
         self.store.current = next;
         trace!("filesystem commit end: version={}", next.version());
-        Ok(next)
+        Ok(self.store.current_snapshot_ref())
     }
 }
 
@@ -600,13 +618,13 @@ where
         Self: 'a;
 
     fn resolve<F: Field>(
-        &self, at: Eterator, entry: &Self::EntryId,
+        &self, at: SnapshotRef, entry: &Self::EntryId,
     ) -> Result<Resolution<F::Content>, Self::Error> {
         trace!("filesystem resolve begin: at={} entry={entry}", at.version());
         FilesystemEntryId::validate(entry.as_str())?;
         self.ensure_retained_snapshot(at)?;
         let key = self.field_key_or_panic::<F>();
-        let result = match self.latest_snapshot_at(entry, at)? {
+        let result = match self.latest_snapshot_at(entry, at.eterator)? {
             | Some((_, header, _)) => match header.get(key) {
                 | Some(value) => Resolution::Content(serde_json::from_value(value.clone())?),
                 | None => Resolution::Absent,
@@ -617,11 +635,21 @@ where
         Ok(result)
     }
 
-    fn entry_exists(&self, at: Eterator, entry: &Self::EntryId) -> Result<bool, Self::Error> {
+    fn entry_exists(&self, at: SnapshotRef, entry: &Self::EntryId) -> Result<bool, Self::Error> {
         trace!("filesystem entry_exists begin: at={} entry={entry}", at.version());
         let exists = self.resolve::<Lifecycle<L>>(at, entry)?.is_content();
         trace!("filesystem entry_exists end: exists={exists}");
         Ok(exists)
+    }
+
+    fn gc_generation(&self) -> Result<GcGeneration, Self::Error> {
+        trace!("filesystem gc_generation");
+        Ok(self.generation)
+    }
+
+    fn current_snapshot(&self) -> Result<SnapshotRef, Self::Error> {
+        trace!("filesystem current_snapshot");
+        Ok(self.current_snapshot_ref())
     }
 
     fn current_version(&self) -> Result<Eterator, Self::Error> {
@@ -642,10 +670,10 @@ where
             let (header, _) = Self::decode_snapshot(&text)?;
             if let Some(value) = header.get(key) {
                 let row = FieldRow::Content(serde_json::from_value(value.clone())?);
-                out.push((version, row));
+                out.push((SnapshotRef::new(self.generation, version), row));
                 was_present = true;
             } else if was_present {
-                out.push((version, FieldRow::Deleted));
+                out.push((SnapshotRef::new(self.generation, version), FieldRow::Deleted));
                 was_present = false;
             }
         }
@@ -678,14 +706,24 @@ where
         FilesystemWriteTxn { store: self, pending: BTreeMap::new() }
     }
 
-    fn retire(&mut self, versions: impl IntoIterator<Item = Eterator>) -> Result<(), Self::Error> {
+    fn retire(
+        &mut self, snapshots: impl IntoIterator<Item = SnapshotRef>,
+    ) -> Result<(), Self::Error> {
         trace!("filesystem retire begin");
-        let versions = versions.into_iter().collect::<Vec<_>>();
+        let snapshots = snapshots.into_iter().collect::<Vec<_>>();
         let retained = self.all_versions()?;
-        for version in &versions {
-            if *version == Eterator::EMPTY || !retained.contains(version) {
-                return Err(FilesystemError::InvalidSnapshot(*version));
+        let mut versions = Vec::new();
+        for snapshot in snapshots {
+            if snapshot.generation != self.generation {
+                return Err(FilesystemError::StaleSnapshot {
+                    requested: snapshot.generation,
+                    current: self.generation,
+                });
             }
+            if snapshot.eterator == Eterator::EMPTY || !retained.contains(&snapshot.eterator) {
+                return Err(FilesystemError::InvalidSnapshot(snapshot));
+            }
+            versions.push(snapshot.eterator);
         }
         self.retired.extend(versions);
         trace!("filesystem retire end: retired={}", self.retired.len());
@@ -693,15 +731,23 @@ where
     }
 
     fn only_keep(
-        &mut self, versions: impl IntoIterator<Item = Eterator>,
+        &mut self, snapshots: impl IntoIterator<Item = SnapshotRef>,
     ) -> Result<(), Self::Error> {
         trace!("filesystem only_keep begin");
-        let keep: BTreeSet<Eterator> = versions.into_iter().collect();
+        let snapshots = snapshots.into_iter().collect::<Vec<_>>();
         let all = self.all_versions()?;
-        for version in &keep {
-            if *version == Eterator::EMPTY || !all.contains(version) {
-                return Err(FilesystemError::InvalidSnapshot(*version));
+        let mut keep = BTreeSet::new();
+        for snapshot in snapshots {
+            if snapshot.generation != self.generation {
+                return Err(FilesystemError::StaleSnapshot {
+                    requested: snapshot.generation,
+                    current: self.generation,
+                });
             }
+            if snapshot.eterator == Eterator::EMPTY || !all.contains(&snapshot.eterator) {
+                return Err(FilesystemError::InvalidSnapshot(snapshot));
+            }
+            keep.insert(snapshot.eterator);
         }
         self.retired = all.into_iter().filter(|v| !keep.contains(v)).collect();
         trace!("filesystem only_keep end: retired={}", self.retired.len());
@@ -717,19 +763,29 @@ where
                 .copied()
                 .filter(|version| !self.retired.contains(version))
                 .collect::<BTreeSet<_>>(),
-            | GcOption::UseLiveSet(live) => {
-                for version in &live {
-                    if *version == Eterator::EMPTY || !all_versions.contains(version) {
-                        return Err(FilesystemError::InvalidSnapshot(*version));
+            | GcOption::UseLiveSet(snapshots) => {
+                let mut live = BTreeSet::new();
+                for snapshot in snapshots {
+                    if snapshot.generation != self.generation {
+                        return Err(FilesystemError::StaleSnapshot {
+                            requested: snapshot.generation,
+                            current: self.generation,
+                        });
                     }
+                    if snapshot.eterator == Eterator::EMPTY
+                        || !all_versions.contains(&snapshot.eterator)
+                    {
+                        return Err(FilesystemError::InvalidSnapshot(snapshot));
+                    }
+                    live.insert(snapshot.eterator);
                 }
                 live
             }
         };
 
+        let mut delete_paths = Vec::new();
         for entry in self.scan_entry_ids()? {
             let versions = self.list_entry_versions(&entry)?;
-            let mut delete_paths = Vec::new();
             for (idx, (version, path)) in versions.iter().enumerate() {
                 let next = versions.get(idx + 1).map(|(v, _)| *v).unwrap_or(Eterator(u64::MAX));
                 let serves_live = live
@@ -741,29 +797,45 @@ where
                     delete_paths.push(path.clone());
                 }
             }
+        }
+        if !delete_paths.is_empty() {
+            let next_generation = self.generation.next();
+            self.persist_gc_generation(next_generation)?;
+            self.generation = next_generation;
             for path in delete_paths {
                 fs::remove_file(path)?;
             }
+            let retained_versions = self.all_versions()?;
+            self.retired.retain(|version| retained_versions.contains(version));
         }
         self.current = Self::scan_current_version(&self.root)?;
         trace!(
-            "filesystem gc end: current_version={} high_water={}",
+            "filesystem gc end: current_version={} gc_generation={}",
             self.current.version(),
-            self.high_water.version()
+            self.generation.number()
         );
         Ok(())
     }
 
-    fn retired_versions(&self) -> Result<BTreeSet<Eterator>, Self::Error> {
-        trace!("filesystem retired_versions");
-        Ok(self.retired.clone())
+    fn retired_snapshots(&self) -> Result<BTreeSet<SnapshotRef>, Self::Error> {
+        trace!("filesystem retired_snapshots");
+        Ok(self
+            .retired
+            .iter()
+            .copied()
+            .map(|eterator| SnapshotRef::new(self.generation, eterator))
+            .collect())
     }
 
-    fn live_versions(&self) -> Result<BTreeSet<Eterator>, Self::Error> {
-        trace!("filesystem live_versions begin");
+    fn live_snapshots(&self) -> Result<BTreeSet<SnapshotRef>, Self::Error> {
+        trace!("filesystem live_snapshots begin");
         let all = self.all_versions()?;
-        let live = all.into_iter().filter(|version| !self.retired.contains(version)).collect();
-        trace!("filesystem live_versions end");
+        let live = all
+            .into_iter()
+            .filter(|version| !self.retired.contains(version))
+            .map(|eterator| SnapshotRef::new(self.generation, eterator))
+            .collect();
+        trace!("filesystem live_snapshots end");
         Ok(live)
     }
 }
@@ -777,7 +849,7 @@ where
     /// This implementation scans entry directories and resolves lifecycle for
     /// each candidate. It is intended for single-user filesystem stores where
     /// entry enumeration is needed for projection commits and checkouts.
-    fn live_entries(&self, at: Eterator) -> Result<BTreeSet<Self::EntryId>, Self::Error> {
+    fn live_entries(&self, at: SnapshotRef) -> Result<BTreeSet<Self::EntryId>, Self::Error> {
         trace!("filesystem live_entries begin: at={}", at.version());
         self.ensure_retained_snapshot(at)?;
         let mut live = BTreeSet::new();
@@ -850,7 +922,7 @@ mod tests {
 
     impl EntryFacet<FilesystemBackend<State>> for NoteFacet {
         fn load_from(
-            store: &FilesystemBackend<State>, at: Eterator, id: &FilesystemEntryId,
+            store: &FilesystemBackend<State>, at: SnapshotRef, id: &FilesystemEntryId,
         ) -> Result<Option<Self>, FilesystemError> {
             if !store.entry_exists(at, id)? {
                 return Ok(None);
@@ -889,7 +961,7 @@ mod tests {
 
     impl EntryFacet<FilesystemBackend<State>> for TagFacet {
         fn load_from(
-            store: &FilesystemBackend<State>, at: Eterator, id: &FilesystemEntryId,
+            store: &FilesystemBackend<State>, at: SnapshotRef, id: &FilesystemEntryId,
         ) -> Result<Option<Self>, FilesystemError> {
             match store.resolve::<TagField>(at, id)? {
                 | Resolution::Content(tag) => Ok(Some(Self { tag })),
@@ -1121,7 +1193,7 @@ mod tests {
     }
 
     #[test]
-    fn high_water_persists_across_gc_and_reopen() {
+    fn gc_generation_persists_across_gc_and_allows_version_reuse() {
         let temp = tempfile::tempdir().unwrap();
         let a = entry("a");
         let (v1, v2) = {
@@ -1130,18 +1202,22 @@ mod tests {
             let v2 = store.write().set::<TagField>(&a, "old".to_owned()).commit().unwrap();
             store.only_keep([v1]).unwrap();
             store.gc(GcOption::UseRetiredSet).unwrap();
-            assert_eq!(store.current_version().unwrap(), v1);
+            assert_eq!(store.current_version().unwrap(), v1.eterator);
+            assert!(store.gc_generation().unwrap() > v1.generation);
             assert!(matches!(
                 store.resolve::<TagField>(v2, &a),
-                Err(FilesystemError::InvalidSnapshot(version)) if version == v2
+                Err(FilesystemError::StaleSnapshot { requested, current })
+                    if requested == v2.generation && current == store.gc_generation().unwrap()
             ));
             (v1, v2)
         };
 
         let mut reopened = open(temp.path());
-        assert_eq!(reopened.current_version().unwrap(), v1);
+        assert_eq!(reopened.current_version().unwrap(), v1.eterator);
+        assert!(reopened.gc_generation().unwrap() > v1.generation);
         let v3 = reopened.write().set::<TagField>(&a, "new".to_owned()).commit().unwrap();
-        assert_eq!(v3.version(), v2.version() + 1);
+        assert_eq!(v3.eterator, v2.eterator);
+        assert_ne!(v3.generation, v2.generation);
     }
 
     // -- write / resolve / current_version --
@@ -1171,9 +1247,9 @@ mod tests {
         assert_eq!(store.current_version().unwrap(), Eterator::EMPTY);
         let v1 = store.write().set::<Lifecycle<State>>(&a, State::Active).commit().unwrap();
         let v2 = store.write().set::<TagField>(&a, "x".to_owned()).commit().unwrap();
-        assert!(Eterator::EMPTY < v1);
+        assert!(Eterator::EMPTY < v1.eterator);
         assert!(v1 < v2);
-        assert_eq!(store.current_version().unwrap(), v2);
+        assert_eq!(store.current_version().unwrap(), v2.eterator);
     }
 
     #[test]
@@ -1296,7 +1372,7 @@ mod tests {
         assert!(store.entry_id_in_use(&a).unwrap());
     }
 
-    // -- retire / only_keep / live_versions / retired_versions --
+    // -- retire / only_keep / live_snapshots / retired_snapshots --
 
     #[test]
     fn retire_adds_to_retired_set() {
@@ -1305,7 +1381,7 @@ mod tests {
         let a = entry("a");
         let v1 = store.write().set::<Lifecycle<State>>(&a, State::Active).commit().unwrap();
         store.retire([v1]).unwrap();
-        assert!(store.retired_versions().unwrap().contains(&v1));
+        assert!(store.retired_snapshots().unwrap().contains(&v1));
     }
 
     #[test]
@@ -1316,20 +1392,20 @@ mod tests {
         let v1 = store.write().set::<Lifecycle<State>>(&a, State::Active).commit().unwrap();
         let v2 = store.write().set::<TagField>(&a, "t".to_owned()).commit().unwrap();
         store.only_keep([v2]).unwrap();
-        let retired = store.retired_versions().unwrap();
+        let retired = store.retired_snapshots().unwrap();
         assert!(retired.contains(&v1));
         assert!(!retired.contains(&v2));
     }
 
     #[test]
-    fn live_versions_is_complement_of_retired() {
+    fn live_snapshots_is_complement_of_retired() {
         let temp = tempfile::tempdir().unwrap();
         let mut store = open(temp.path());
         let a = entry("a");
         let v1 = store.write().set::<Lifecycle<State>>(&a, State::Active).commit().unwrap();
         let v2 = store.write().set::<TagField>(&a, "t".to_owned()).commit().unwrap();
         store.retire([v1]).unwrap();
-        let live = store.live_versions().unwrap();
+        let live = store.live_snapshots().unwrap();
         assert!(!live.contains(&v1));
         assert!(live.contains(&v2));
     }
@@ -1368,9 +1444,39 @@ mod tests {
         let v2 = store.write().set::<CountField>(&a, 2).commit().unwrap();
         store.retire([v1]).unwrap();
         store.gc(GcOption::UseRetiredSet).unwrap();
-        // v1 file is gone; reading at v2 still works.
+        let v2 = SnapshotRef::new(store.gc_generation().unwrap(), v2.eterator);
+        // v1 file is gone; reading at v2 in the new generation still works.
         assert_eq!(store.resolve::<CountField>(v2, &a).unwrap(), Resolution::Content(2));
         assert!(store.field_history::<CountField>(&a).unwrap().len() == 1);
+    }
+
+    #[test]
+    fn gc_preserves_retired_snapshot_that_serves_live_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = open(temp.path());
+        let a = entry("a");
+        let b = entry("b");
+        let v1 = store
+            .write()
+            .set::<Lifecycle<State>>(&a, State::Active)
+            .set::<CountField>(&a, 1)
+            .commit()
+            .unwrap();
+        let v2 = store.write().set::<Lifecycle<State>>(&b, State::Active).commit().unwrap();
+        let v3 = store.write().set::<TagField>(&b, "temporary".to_owned()).commit().unwrap();
+
+        store.only_keep([v2]).unwrap();
+        store.gc(GcOption::UseRetiredSet).unwrap();
+
+        let generation = store.gc_generation().unwrap();
+        let v1 = SnapshotRef::new(generation, v1.eterator);
+        let v2 = SnapshotRef::new(generation, v2.eterator);
+        let v3 = SnapshotRef::new(generation, v3.eterator);
+        let retired = store.retired_snapshots().unwrap();
+        assert!(retired.contains(&v1));
+        assert!(!retired.contains(&v2));
+        assert!(!retired.contains(&v3));
+        assert_eq!(store.resolve::<CountField>(v2, &a).unwrap(), Resolution::Content(1));
     }
 
     #[test]
@@ -1386,6 +1492,7 @@ mod tests {
             .unwrap();
         let v2 = store.write().set::<CountField>(&a, 20).commit().unwrap();
         store.gc(GcOption::UseLiveSet(std::collections::BTreeSet::from([v2]))).unwrap();
+        let v2 = SnapshotRef::new(store.gc_generation().unwrap(), v2.eterator);
         assert_eq!(store.resolve::<CountField>(v2, &a).unwrap(), Resolution::Content(20));
         // v1 is now unreachable; its row was removed.
         let hist = store.field_history::<CountField>(&a).unwrap();
