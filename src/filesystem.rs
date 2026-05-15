@@ -18,11 +18,19 @@
 //! This backend stores one markdown file per `(EntryId, version)` snapshot. It
 //! keeps no persistent retired-snapshot state on disk. Retired/live snapshot
 //! bookkeeping is in memory and controlled by callers through [`crate::GcOption`].
+//!
+//! Backend-written snapshot files are finalized as read-only files. Entry
+//! directories and `Eter.lock.toml` remain writable so later commits and garbage
+//! collection can create, record, and remove version files. The read-only mode
+//! protects snapshot contents from accidental in-place edits; snapshot retention
+//! is still defined by the protocol's liveness and garbage-collection rules.
 
 use std::any::TypeId;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Debug;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
@@ -193,6 +201,10 @@ impl FilesystemFieldRegistry {
 /// A write creates a full entry snapshot at the next allocated version:
 /// updated fields are written from the transaction and unchanged fields are
 /// copied from the latest earlier snapshot for that entry.
+///
+/// Snapshot files written by this backend are finalized as read-only files.
+/// Entry directories remain writable because version creation and garbage
+/// collection operate by creating and deleting complete snapshot files.
 ///
 /// Note: this backend keeps the retired-snapshot set only in memory. Reopening a
 /// filesystem store starts with no retired snapshots.
@@ -404,7 +416,52 @@ where
         let filename = format!("{:016x}-{}.md", version.version(), entry.as_str());
         let path = dir.join(filename);
         let text = Self::encode_snapshot(header, body)?;
-        fs::write(path, text)?;
+        fs::write(&path, text)?;
+        Self::make_snapshot_readonly(&path)?;
+        Ok(())
+    }
+
+    /// Finalize a backend-written snapshot file as read-only.
+    ///
+    /// Note: read-only file mode prevents accidental content writes. Snapshot
+    /// deletion is still controlled by directory permissions on Unix-like
+    /// filesystems and by the readonly file attribute on Windows.
+    fn make_snapshot_readonly(path: &Path) -> Result<(), FilesystemError> {
+        let mut permissions = fs::metadata(path)?.permissions();
+        #[cfg(unix)]
+        {
+            permissions.set_mode(permissions.mode() & !0o222);
+        }
+        #[cfg(not(unix))]
+        {
+            permissions.set_readonly(true);
+        }
+        fs::set_permissions(path, permissions)?;
+        Ok(())
+    }
+
+    /// Restore the minimum writability required before removing a snapshot file.
+    ///
+    /// Note: Windows rejects deletion of readonly files, so cleanup clears the
+    /// readonly attribute before calling `remove_file`. Unix cleanup restores
+    /// owner writability to keep the deletion path explicit and symmetric.
+    fn make_snapshot_writable_for_removal(path: &Path) -> Result<(), FilesystemError> {
+        let mut permissions = fs::metadata(path)?.permissions();
+        #[cfg(unix)]
+        {
+            permissions.set_mode(permissions.mode() | 0o200);
+        }
+        #[cfg(not(unix))]
+        {
+            permissions.set_readonly(false);
+        }
+        fs::set_permissions(path, permissions)?;
+        Ok(())
+    }
+
+    fn remove_snapshot_file(path: &Path) -> Result<(), FilesystemError> {
+        Self::make_snapshot_writable_for_removal(path)?;
+        fs::remove_file(path)?;
         Ok(())
     }
 
@@ -475,7 +532,7 @@ where
         for entry in self.scan_entry_ids()? {
             for (version, path) in self.list_entry_versions(&entry)? {
                 if version > self.current {
-                    fs::remove_file(path)?;
+                    Self::remove_snapshot_file(&path)?;
                 }
             }
         }
@@ -895,7 +952,7 @@ where
             self.generation = next_generation;
             self.current = next_current;
             for path in delete_paths {
-                fs::remove_file(path)?;
+                Self::remove_snapshot_file(&path)?;
             }
             self.retired.retain(|version| retained_versions.contains(version));
         }
@@ -975,6 +1032,8 @@ mod tests {
         Resolution, WriteTxn,
     };
     use serde::{Deserialize, Serialize};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     // -- Helpers --
 
@@ -1002,6 +1061,22 @@ mod tests {
 
     fn entry(s: &str) -> FilesystemEntryId {
         FilesystemEntryId::new(s).unwrap()
+    }
+
+    fn version_file_path(root: &Path, entry: &FilesystemEntryId, version: Eterator) -> PathBuf {
+        root.join(entry.as_str()).join(format!("{:016x}-{}.md", version.version(), entry.as_str()))
+    }
+
+    fn assert_snapshot_readonly(path: &Path) {
+        let permissions = fs::metadata(path).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            assert_eq!(permissions.mode() & 0o222, 0);
+        }
+        #[cfg(not(unix))]
+        {
+            assert!(permissions.readonly());
+        }
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1419,6 +1494,26 @@ mod tests {
     }
 
     #[test]
+    fn remove_uncommitted_snapshots_removes_readonly_version_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = entry("a");
+        {
+            let store = open(temp.path());
+            let mut header = Map::new();
+            header.insert("lifecycle".to_owned(), serde_json::to_value(State::Active).unwrap());
+            store.write_snapshot(&a, Eterator(1), &header, "stale\n").unwrap();
+            assert_snapshot_readonly(&version_file_path(temp.path(), &a, Eterator(1)));
+        }
+
+        let mut reopened = open(temp.path());
+        let committed =
+            reopened.write().set::<Lifecycle<State>>(&a, State::Active).commit().unwrap();
+
+        assert_eq!(committed.eterator, Eterator(1));
+        assert_snapshot_readonly(&version_file_path(temp.path(), &a, committed.eterator));
+    }
+
+    #[test]
     fn gc_generation_persists_across_gc_and_allows_version_reuse() {
         let temp = tempfile::tempdir().unwrap();
         let a = entry("a");
@@ -1466,6 +1561,16 @@ mod tests {
             store.resolve::<TagField>(v1, &a).unwrap(),
             Resolution::Content("hello".to_owned())
         );
+    }
+
+    #[test]
+    fn commit_finalizes_version_files_as_readonly() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = open(temp.path());
+        let a = entry("a");
+        let v1 = store.write().set::<Lifecycle<State>>(&a, State::Active).commit().unwrap();
+
+        assert_snapshot_readonly(&version_file_path(temp.path(), &a, v1.eterator));
     }
 
     #[test]
@@ -1672,9 +1777,12 @@ mod tests {
             .unwrap();
         let v2 = store.write().set::<CountField>(&a, 2).commit().unwrap();
         store.retire([v1]).unwrap();
+        let v1_path = version_file_path(temp.path(), &a, v1.eterator);
+        assert_snapshot_readonly(&v1_path);
         store.gc(GcOption::UseRetiredSet).unwrap();
         let v2 = SnapshotRef::new(store.gc_generation().unwrap(), v2.eterator);
         // v1 file is gone; reading at v2 in the new generation still works.
+        assert!(!v1_path.exists());
         assert_eq!(store.resolve::<CountField>(v2, &a).unwrap(), Resolution::Content(2));
         assert!(store.field_history::<CountField>(&a).unwrap().len() == 1);
     }

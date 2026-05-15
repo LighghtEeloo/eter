@@ -279,6 +279,11 @@ lexicographic filename order matches version order. The `<entry_id>` suffix
 is redundant with the directory name but aids readability in editors and
 tools that display only the filename.
 
+Version files are finalized as read-only files. Entry directories remain
+writable so later writes and garbage collection can create and remove version
+files. Filesystem read-only mode constrains content writes; retention is
+defined by snapshot liveness and garbage collection.
+
 The backend persists global metadata in `Eter.lock.toml`. The file stores the
 lock-file format version, the current GC generation, and the highest committed
 version. It does not record a retired-snapshot set. Retired snapshots are tracked
@@ -341,8 +346,9 @@ body field, return the markdown text.
 **write.** Assign the next version, one greater than the current committed
 version. Remove version files above the committed boundary, then create a new
 file in `<root>/<entry_id>/` with the updated fields and all unchanged fields
-copied from the previous version. After all files are written, persist
-`committed_version`. Return a `SnapshotRef` in the current GC generation.
+copied from the previous version. Mark each new version file read-only before
+persisting `committed_version`. Return a `SnapshotRef` in the current GC
+generation.
 
 **current_version.** The `committed_version` in `Eter.lock.toml`. Version files
 above this value are uncommitted remnants. They are ignored by reads and removed
@@ -366,7 +372,8 @@ projection commit and checkout paths.
 **gc.** Delete version files whose served version ranges contain no live
 coordinate. The backend may use its in-memory retired set or an explicit live
 set supplied to the collection call. When files are deleted, persist the next
-GC generation and committed version before removing them.
+GC generation and committed version before removing them. A read-only version
+file is made writable immediately before deletion.
 
 
 ## LMDB Backend
