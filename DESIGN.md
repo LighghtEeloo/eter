@@ -195,9 +195,8 @@ older generations are stale and are rejected.
 The retained field history is the single source of truth for entry content.
 All other data structures are derived caches or indices.
 
-- **Current version.** The maximum retained version. Avoids a full scan when
-  answering `current_version`; updated on writes and rebuilt after GC or open
-  when needed.
+- **Current version.** The highest committed retained version. Avoids treating
+  incomplete filesystem writes as retained snapshots.
 - **GC generation.** The current retained coordinate generation. It validates
   `SnapshotRef`s and records that numeric `Eterator` coordinates may have been
   reused after physical collection.
@@ -281,15 +280,16 @@ is redundant with the directory name but aids readability in editors and
 tools that display only the filename.
 
 The backend persists global metadata in `Eter.lock.toml`. The file stores the
-lock-file format version and the current GC generation. It does not record a
-retired-snapshot set. Retired snapshots are tracked in memory for the current
-backend instance, and callers may also provide an explicit live set to garbage
-collection. Derived caches are held in memory and rebuilt from the file tree on
-startup.
+lock-file format version, the current GC generation, and the highest committed
+version. It does not record a retired-snapshot set. Retired snapshots are tracked
+in memory for the current backend instance, and callers may also provide an
+explicit live set to garbage collection. Derived caches are held in memory and
+rebuilt from the file tree on startup.
 
 ```toml
 lock_format_version = 1
 gc_generation = 0
+committed_version = 0
 ```
 
 ### File Format
@@ -338,21 +338,22 @@ simpler resolution, atomic per-entry snapshots, and human-readable files.
 `Eterator`, parse the YAML header, and return the requested field. For the
 body field, return the markdown text.
 
-**write.** Assign the next version, one greater than the current retained
-version. Create a new file in `<root>/<entry_id>/` with the updated fields and
-all unchanged fields copied from the previous version. Return a `SnapshotRef`
-in the current GC generation.
+**write.** Assign the next version, one greater than the current committed
+version. Remove version files above the committed boundary, then create a new
+file in `<root>/<entry_id>/` with the updated fields and all unchanged fields
+copied from the previous version. After all files are written, persist
+`committed_version`. Return a `SnapshotRef` in the current GC generation.
 
-**current_version.** The maximum hex version across all filenames in the
-root. Cached in memory after the initial scan, set to the committed version on
-write, and rebuilt after GC. This value may move backward after GC removes the
-newest retained snapshots.
+**current_version.** The `committed_version` in `Eter.lock.toml`. Version files
+above this value are uncommitted remnants. They are ignored by reads and removed
+before the next write. This value may move backward after GC removes the newest
+retained snapshots.
 
 **gc_generation.** The current GC generation. Stored in `Eter.lock.toml` as an
 unsigned TOML integer. Created with the initial generation when missing on
 open.
 
-**field_history.** List all files in `<root>/<entry_id>/` in version order
+**field_history.** List committed files in `<root>/<entry_id>/` in version order
 and parse the requested field from each. Because files are full-entry
 snapshots, copied unchanged values may appear as later physical rows. When a
 field is present in one snapshot and absent in the next, the backend reports a
@@ -365,7 +366,7 @@ projection commit and checkout paths.
 **gc.** Delete version files whose served version ranges contain no live
 coordinate. The backend may use its in-memory retired set or an explicit live
 set supplied to the collection call. When files are deleted, persist the next
-GC generation before removing them.
+GC generation and committed version before removing them.
 
 
 ## LMDB Backend

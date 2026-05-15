@@ -6,8 +6,9 @@
 //! - `version` is a 64-bit value encoded as 16 lowercase hex digits.
 //! - each file contains YAML frontmatter and a markdown body.
 //!
-//! `Eter.lock.toml` stores backend-global state such as the current GC
-//! generation.
+//! `Eter.lock.toml` stores backend-global state:
+//! - the current GC generation.
+//! - the highest version whose whole write transaction is committed.
 //!
 //! Frontmatter stores protocol fields by key. A key's presence means the field
 //! has content in that full-entry snapshot; omitting the key means the field is
@@ -51,25 +52,28 @@ struct FilesystemGlobalState {
     lock_format_version: u32,
     /// Current GC generation.
     gc_generation: u64,
+    /// Highest version whose complete write transaction is committed.
+    committed_version: u64,
 }
 
 impl FilesystemGlobalState {
     fn initial() -> Self {
-        Self::with_generation(GcGeneration::INITIAL)
+        Self::with_snapshot(SnapshotRef::new(GcGeneration::INITIAL, Eterator::EMPTY))
     }
 
-    fn with_generation(generation: GcGeneration) -> Self {
+    fn with_snapshot(snapshot: SnapshotRef) -> Self {
         Self {
             lock_format_version: GLOBAL_STATE_FORMAT_VERSION,
-            gc_generation: generation.number(),
+            gc_generation: snapshot.generation.number(),
+            committed_version: snapshot.version(),
         }
     }
 
-    fn generation(self) -> Result<GcGeneration, FilesystemError> {
+    fn snapshot_ref(self) -> Result<SnapshotRef, FilesystemError> {
         if self.lock_format_version != GLOBAL_STATE_FORMAT_VERSION {
             return Err(FilesystemError::UnsupportedLockFormat(self.lock_format_version));
         }
-        Ok(GcGeneration(self.gc_generation))
+        Ok(SnapshotRef::new(GcGeneration(self.gc_generation), Eterator(self.committed_version)))
     }
 }
 
@@ -245,29 +249,34 @@ where
             fs::create_dir_all(&root)?;
         }
 
-        let current = Self::scan_current_version(&root)?;
         let stored_state = Self::read_global_state(&root)?;
-        let generation = match stored_state {
-            | Some(state) => state.generation()?,
+        let snapshot = match stored_state {
+            | Some(state) => state.snapshot_ref()?,
             | None => {
+                let discovered = Self::scan_current_version(&root)?;
+                if discovered != Eterator::EMPTY {
+                    return Err(FilesystemError::MissingGlobalStateWithSnapshots(root));
+                }
                 let state = FilesystemGlobalState::initial();
                 Self::persist_global_state_to(&root, state)?;
-                state.generation()?
+                state.snapshot_ref()?
             }
         };
         trace!(
             "filesystem open end: current_version={} gc_generation={}",
-            current.version(),
-            generation.number()
+            snapshot.version(),
+            snapshot.generation.number()
         );
-        Ok(Self {
+        let store = Self {
             root,
             fields,
             retired: BTreeSet::new(),
-            current,
-            generation,
+            current: snapshot.eterator,
+            generation: snapshot.generation,
             _lifecycle: std::marker::PhantomData,
-        })
+        };
+        store.validate_committed_version()?;
+        Ok(store)
     }
 
     fn global_state_path(root: &Path) -> PathBuf {
@@ -292,11 +301,8 @@ where
         Ok(())
     }
 
-    fn persist_global_state(&self, generation: GcGeneration) -> Result<(), FilesystemError> {
-        Self::persist_global_state_to(
-            &self.root,
-            FilesystemGlobalState::with_generation(generation),
-        )
+    fn persist_global_state(&self, snapshot: SnapshotRef) -> Result<(), FilesystemError> {
+        Self::persist_global_state_to(&self.root, FilesystemGlobalState::with_snapshot(snapshot))
     }
 
     fn next_version(&self) -> Eterator {
@@ -450,6 +456,32 @@ where
         Ok(versions)
     }
 
+    fn retained_versions(&self) -> Result<BTreeSet<Eterator>, FilesystemError> {
+        Ok(self.all_versions()?.into_iter().filter(|version| *version <= self.current).collect())
+    }
+
+    fn validate_committed_version(&self) -> Result<(), FilesystemError> {
+        if self.current == Eterator::EMPTY {
+            return Ok(());
+        }
+        if self.all_versions()?.contains(&self.current) {
+            Ok(())
+        } else {
+            Err(FilesystemError::MissingCommittedVersion(self.current))
+        }
+    }
+
+    fn remove_uncommitted_snapshots(&self) -> Result<(), FilesystemError> {
+        for entry in self.scan_entry_ids()? {
+            for (version, path) in self.list_entry_versions(&entry)? {
+                if version > self.current {
+                    fs::remove_file(path)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn current_snapshot_ref(&self) -> SnapshotRef {
         SnapshotRef::new(self.generation, self.current)
     }
@@ -464,7 +496,10 @@ where
         if at.eterator == Eterator::EMPTY {
             return Ok(());
         }
-        if self.all_versions()?.contains(&at.eterator) {
+        if at.eterator > self.current {
+            return Err(FilesystemError::InvalidSnapshot(at));
+        }
+        if self.retained_versions()?.contains(&at.eterator) {
             Ok(())
         } else {
             Err(FilesystemError::InvalidSnapshot(at))
@@ -525,6 +560,12 @@ pub enum FilesystemError {
     /// The requested snapshot is no longer retained by the store.
     #[error("invalid or collected snapshot version: {0:?}")]
     InvalidSnapshot(SnapshotRef),
+    /// The global state file is missing even though snapshot files are present.
+    #[error("missing filesystem lock file for non-empty store: {0}")]
+    MissingGlobalStateWithSnapshots(PathBuf),
+    /// The committed version in the global state has no snapshot file.
+    #[error("committed snapshot version has no version file: {0:?}")]
+    MissingCommittedVersion(Eterator),
     /// Markdown frontmatter is malformed.
     #[error("invalid frontmatter format")]
     InvalidFrontmatter,
@@ -624,6 +665,7 @@ where
             return Ok(self.store.current_snapshot_ref());
         }
 
+        self.store.remove_uncommitted_snapshots()?;
         let next = self.store.next_version();
         for (entry, updates) in self.pending {
             let previous = self.store.latest_snapshot_at(&entry, self.store.current)?;
@@ -644,6 +686,8 @@ where
             let body = updates.body.unwrap_or(body);
             self.store.write_snapshot(&entry, next, &header, &body)?;
         }
+        let snapshot = SnapshotRef::new(self.store.generation, next);
+        self.store.persist_global_state(snapshot)?;
         self.store.current = next;
         trace!("filesystem commit end: version={}", next.version());
         Ok(self.store.current_snapshot_ref())
@@ -711,6 +755,9 @@ where
         let mut out = Vec::new();
         let mut was_present = false;
         for (version, path) in self.list_entry_versions(entry)? {
+            if version > self.current {
+                continue;
+            }
             let text = fs::read_to_string(path)?;
             let (header, _) = Self::decode_snapshot(&text)?;
             if let Some(value) = header.get(key) {
@@ -734,14 +781,8 @@ where
             trace!("filesystem entry_id_in_use end: in_use=false");
             return Ok(false);
         }
-        let mut has_file = false;
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            if entry.file_type()?.is_file() {
-                has_file = true;
-                break;
-            }
-        }
+        let has_file =
+            self.list_entry_versions(id)?.into_iter().any(|(version, _)| version <= self.current);
         trace!("filesystem entry_id_in_use end: in_use={has_file}");
         Ok(has_file)
     }
@@ -756,7 +797,7 @@ where
     ) -> Result<(), Self::Error> {
         trace!("filesystem retire begin");
         let snapshots = snapshots.into_iter().collect::<Vec<_>>();
-        let retained = self.all_versions()?;
+        let retained = self.retained_versions()?;
         let mut versions = Vec::new();
         for snapshot in snapshots {
             if snapshot.generation != self.generation {
@@ -780,7 +821,7 @@ where
     ) -> Result<(), Self::Error> {
         trace!("filesystem only_keep begin");
         let snapshots = snapshots.into_iter().collect::<Vec<_>>();
-        let all = self.all_versions()?;
+        let all = self.retained_versions()?;
         let mut keep = BTreeSet::new();
         for snapshot in snapshots {
             if snapshot.generation != self.generation {
@@ -801,7 +842,7 @@ where
 
     fn gc(&mut self, option: GcOption) -> Result<(), Self::Error> {
         trace!("filesystem gc begin");
-        let all_versions = self.all_versions()?;
+        let all_versions = self.retained_versions()?;
         let live = match option {
             | GcOption::UseRetiredSet => all_versions
                 .iter()
@@ -829,6 +870,7 @@ where
         };
 
         let mut delete_paths = Vec::new();
+        let mut retained_versions = BTreeSet::new();
         for entry in self.scan_entry_ids()? {
             let versions = self.list_entry_versions(&entry)?;
             for (idx, (version, path)) in versions.iter().enumerate() {
@@ -840,20 +882,23 @@ where
                     .unwrap_or(false);
                 if !serves_live {
                     delete_paths.push(path.clone());
+                } else {
+                    retained_versions.insert(*version);
                 }
             }
         }
         if !delete_paths.is_empty() {
             let next_generation = self.generation.next();
-            self.persist_global_state(next_generation)?;
+            let next_current =
+                retained_versions.iter().next_back().copied().unwrap_or(Eterator::EMPTY);
+            self.persist_global_state(SnapshotRef::new(next_generation, next_current))?;
             self.generation = next_generation;
+            self.current = next_current;
             for path in delete_paths {
                 fs::remove_file(path)?;
             }
-            let retained_versions = self.all_versions()?;
             self.retired.retain(|version| retained_versions.contains(version));
         }
-        self.current = Self::scan_current_version(&self.root)?;
         trace!(
             "filesystem gc end: current_version={} gc_generation={}",
             self.current.version(),
@@ -874,7 +919,7 @@ where
 
     fn live_snapshots(&self) -> Result<BTreeSet<SnapshotRef>, Self::Error> {
         trace!("filesystem live_snapshots begin");
-        let all = self.all_versions()?;
+        let all = self.retained_versions()?;
         let live = all
             .into_iter()
             .filter(|version| !self.retired.contains(version))
@@ -1243,6 +1288,7 @@ mod tests {
         let lock = std::fs::read_to_string(lock_path).unwrap();
         assert!(lock.contains("lock_format_version = 1"));
         assert!(lock.contains("gc_generation = 0"));
+        assert!(lock.contains("committed_version = 0"));
     }
 
     #[test]
@@ -1259,7 +1305,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(
             temp.path().join("Eter.lock.toml"),
-            "lock_format_version = 2\ngc_generation = 0\n",
+            "lock_format_version = 2\ngc_generation = 0\ncommitted_version = 0\n",
         )
         .unwrap();
         let registry = builtins_registry::<State>();
@@ -1274,7 +1320,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(
             temp.path().join("Eter.lock.toml"),
-            "lock_format_version = 1\ngc_generation = \"bad\"\n",
+            "lock_format_version = 1\ngc_generation = \"bad\"\ncommitted_version = 0\n",
         )
         .unwrap();
         let registry = builtins_registry::<State>();
@@ -1282,6 +1328,94 @@ mod tests {
             FilesystemBackend::<State>::open(temp.path(), registry),
             Err(FilesystemError::TomlDecode(_))
         ));
+    }
+
+    #[test]
+    fn open_rejects_missing_global_state_when_snapshots_exist() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = open(temp.path());
+        let a = entry("a");
+        store.write().set::<Lifecycle<State>>(&a, State::Active).commit().unwrap();
+        std::fs::remove_file(temp.path().join("Eter.lock.toml")).unwrap();
+
+        let registry = builtins_registry::<State>();
+        assert!(matches!(
+            FilesystemBackend::<State>::open(temp.path(), registry),
+            Err(FilesystemError::MissingGlobalStateWithSnapshots(_))
+        ));
+    }
+
+    #[test]
+    fn open_rejects_committed_version_without_snapshot_file() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("Eter.lock.toml"),
+            "lock_format_version = 1\ngc_generation = 0\ncommitted_version = 1\n",
+        )
+        .unwrap();
+
+        let registry = builtins_registry::<State>();
+        assert!(matches!(
+            FilesystemBackend::<State>::open(temp.path(), registry),
+            Err(FilesystemError::MissingCommittedVersion(Eterator(1)))
+        ));
+    }
+
+    #[test]
+    fn open_uses_committed_version_instead_of_max_filename() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = entry("a");
+        {
+            let mut store = open(temp.path());
+            store
+                .write()
+                .set::<Lifecycle<State>>(&a, State::Active)
+                .set::<CountField>(&a, 1)
+                .commit()
+                .unwrap();
+            let mut header = Map::new();
+            header.insert("lifecycle".to_owned(), serde_json::to_value(State::Active).unwrap());
+            header.insert("count".to_owned(), serde_json::json!(99));
+            store.write_snapshot(&a, Eterator(2), &header, "stale\n").unwrap();
+        }
+
+        let mut reopened = open(temp.path());
+        assert_eq!(reopened.current_version().unwrap(), Eterator(1));
+        let stale = SnapshotRef::new(reopened.gc_generation().unwrap(), Eterator(2));
+        assert!(matches!(
+            reopened.resolve::<CountField>(stale, &a),
+            Err(FilesystemError::InvalidSnapshot(_))
+        ));
+        assert_eq!(
+            reopened.field_history::<CountField>(&a).unwrap(),
+            vec![(SnapshotRef::new(GcGeneration::INITIAL, Eterator(1)), FieldRow::Content(1))]
+        );
+
+        let b = entry("b");
+        let committed =
+            reopened.write().set::<Lifecycle<State>>(&b, State::Active).commit().unwrap();
+        assert_eq!(committed.eterator, Eterator(2));
+        assert!(!temp.path().join("a/0000000000000002-a.md").exists());
+        assert_eq!(reopened.resolve::<CountField>(committed, &a).unwrap(), Resolution::Content(1));
+    }
+
+    #[test]
+    fn entry_id_in_use_ignores_uncommitted_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = entry("a");
+        {
+            let store = open(temp.path());
+            let mut header = Map::new();
+            header.insert("lifecycle".to_owned(), serde_json::to_value(State::Active).unwrap());
+            store.write_snapshot(&a, Eterator(1), &header, "stale\n").unwrap();
+        }
+
+        let mut reopened = open(temp.path());
+        assert!(!reopened.entry_id_in_use(&a).unwrap());
+        let committed =
+            reopened.write().set::<Lifecycle<State>>(&a, State::Active).commit().unwrap();
+        assert_eq!(committed.eterator, Eterator(1));
+        assert!(reopened.entry_id_in_use(&a).unwrap());
     }
 
     #[test]
@@ -1312,6 +1446,7 @@ mod tests {
         assert_ne!(v3.generation, v2.generation);
         let lock = std::fs::read_to_string(temp.path().join("Eter.lock.toml")).unwrap();
         assert!(lock.contains(&format!("gc_generation = {}", v3.generation.number())));
+        assert!(lock.contains(&format!("committed_version = {}", v3.version())));
     }
 
     // -- write / resolve / current_version --
